@@ -1,3 +1,5 @@
+# Legacy upstream example: unsupported by the cloud qualification fork.
+# Use the qualification contract in README.md and cloud-ctrl generated jobs.
 job "opencode-server" {
   datacenters = ["dc1"]
   type        = "batch"

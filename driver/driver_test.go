@@ -3,9 +3,13 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -35,7 +39,7 @@ func fixture(t *testing.T) (*Driver, *drivers.TaskConfig) {
 	os.WriteFile(errout, nil, 0600)
 	d := NewTartDriver(hclog.NewNullLogger()).(*Driver)
 	d.config = c
-	cfg := &drivers.TaskConfig{ID: "task1", AllocID: "alloc1", JobName: "qualify", Namespace: "canary", Name: "build", AllocDir: filepath.Join(root, "alloc"), StdoutPath: out, StderrPath: errout, Resources: &drivers.Resources{NomadResources: &structs.AllocatedTaskResources{Cpu: structs.AllocatedCpuResources{CpuShares: 20000}, Memory: structs.AllocatedMemoryResources{MemoryMB: 9216}}}}
+	cfg := &drivers.TaskConfig{ID: "task1", AllocID: "alloc1", JobName: "qualify", JobID: "qualify", Namespace: "canary", Name: "build", AllocDir: filepath.Join(root, "alloc"), StdoutPath: out, StderrPath: errout, Resources: &drivers.Resources{NomadResources: &structs.AllocatedTaskResources{Cpu: structs.AllocatedCpuResources{CpuShares: 20000}, Memory: structs.AllocatedMemoryResources{MemoryMB: 9216}}}}
 	return d, cfg
 }
 func start(t *testing.T, d *Driver, cfg *drivers.TaskConfig, command string) *drivers.TaskHandle {
@@ -105,7 +109,7 @@ func TestAdmissionAndResourceValidation(t *testing.T) {
 	if e := d.config.validate(); e != nil {
 		t.Fatal(e)
 	}
-	for _, mutate := range []func(*drivers.TaskConfig){func(c *drivers.TaskConfig) { c.User = "root" }, func(c *drivers.TaskConfig) { c.Namespace = "default" }, func(c *drivers.TaskConfig) { c.JobName = "untrusted" }, func(c *drivers.TaskConfig) { c.Resources.NomadResources.Cpu.CpuShares = 100 }, func(c *drivers.TaskConfig) { c.Resources.NomadResources.Memory.MemoryMB = 8192 }} {
+	for _, mutate := range []func(*drivers.TaskConfig){func(c *drivers.TaskConfig) { c.User = "root" }, func(c *drivers.TaskConfig) { c.Namespace = "default" }, func(c *drivers.TaskConfig) { c.JobID = "untrusted" }, func(c *drivers.TaskConfig) { c.Resources.NomadResources.Cpu.CpuShares = 100 }, func(c *drivers.TaskConfig) { c.Resources.NomadResources.Memory.MemoryMB = 8192 }} {
 		copy := cfg.Copy()
 		mutate(copy)
 		if e := d.config.validateTask(copy, TaskConfig{Command: "true"}); e == nil {
@@ -230,3 +234,107 @@ case "$1" in
  esac;;
 esac
 `
+
+func TestCancelledMissingAndStalledLogReader(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "log")
+	if e := syscall.Mkfifo(path, 0600); e != nil {
+		t.Fatal(e)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if f, e := openLog(ctx, path); e == nil {
+		f.Close()
+		t.Fatal("opened without reader")
+	}
+	reader, e := syscall.Open(path, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer syscall.Close(reader)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel2()
+	writer, e := openLog(ctx2, path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer writer.Close()
+	_, e = (logWriter{ctx2, writer}).Write(make([]byte, 16<<20))
+	if e == nil {
+		t.Fatal("stalled reader did not cancel")
+	}
+}
+func TestConcurrentLogLimit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	writer := &cappedWriter{w: io.Discard, remaining: 100, cancel: cancel}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				_, _ = writer.Write([]byte("test"))
+			}
+		}()
+	}
+	wg.Wait()
+	if ctx.Err() == nil || writer.remaining != 0 {
+		t.Fatal("shared limit not enforced")
+	}
+}
+func TestParentDeathStopsCloneBeforeRecoveryLock(t *testing.T) {
+	dir := t.TempDir()
+	lock, e := os.OpenFile(filepath.Join(dir, "lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); e != nil {
+		t.Fatal(e)
+	}
+	read, write, e := os.Pipe()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer read.Close()
+	defer write.Close()
+	executable, e := os.Executable()
+	if e != nil {
+		t.Fatal(e)
+	}
+	marker := filepath.Join(dir, "published")
+	script := filepath.Join(dir, "clone")
+	if e = os.WriteFile(script, []byte("#!/bin/sh\nsleep 2\necho published > '"+marker+"'\n"), 0700); e != nil {
+		t.Fatal(e)
+	}
+	cmd := exec.Command(executable, "--cloud-tart-child", script)
+	cmd.ExtraFiles = []*os.File{read, lock}
+	if e = cmd.Start(); e != nil {
+		t.Fatal(e)
+	}
+	lock.Close()
+	other, e := os.OpenFile(filepath.Join(dir, "lock"), os.O_RDWR, 0)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer other.Close()
+	if syscall.Flock(int(other.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil {
+		t.Fatal("recovery raced live helper")
+	}
+	write.Close() // same EOF as plugin SIGKILL
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		cmd.Process.Kill()
+		t.Fatal("orphan supervisor")
+	}
+	if e = syscall.Flock(int(other.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); e != nil {
+		t.Fatal("lock retained after helper stopped", e)
+	}
+	time.Sleep(2100 * time.Millisecond)
+	if _, e = os.Stat(marker); !os.IsNotExist(e) {
+		t.Fatal("clone published after recovery")
+	}
+}

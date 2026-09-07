@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -27,14 +28,15 @@ var Version = "2.0.0-cloud.1"
 type Driver struct {
 	drivers.DriverSignalTaskNotSupported
 	drivers.DriverExecTaskNotSupported
-	config  Config
-	ctx     context.Context
-	eventer *eventer.Eventer
-	logger  hclog.Logger
-	mu      sync.Mutex
-	tasks   map[string]*taskHandle
-	busy    bool
-	lock    *os.File
+	config                 Config
+	ctx                    context.Context
+	eventer                *eventer.Eventer
+	logger                 hclog.Logger
+	mu                     sync.Mutex
+	tasks                  map[string]*taskHandle
+	busy                   bool
+	lock                   *os.File
+	lifeReader, lifeWriter *os.File
 }
 type taskHandle struct {
 	mu     sync.Mutex
@@ -62,14 +64,15 @@ func (d *Driver) Capabilities() (*drivers.Capabilities, error) {
 func (d *Driver) SetConfig(cfg *base.Config) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	// Configuration changes require a drained restart; never reconcile active
-	// tasks merely because Nomad sends another configuration RPC.
-	if d.lock != nil {
-		return fmt.Errorf("driver already configured; drain and restart to change profile")
-	}
 	var c Config
 	if e := base.MsgPackDecode(cfg.PluginConfig, &c); e != nil {
 		return e
+	}
+	if d.lock != nil {
+		if reflect.DeepEqual(c, d.config) {
+			return nil
+		}
+		return fmt.Errorf("drain and restart to change profile")
 	}
 	if e := c.validate(); e != nil {
 		return e
@@ -118,7 +121,15 @@ func (d *Driver) SetConfig(cfg *base.Config) error {
 		return fmt.Errorf("another driver owns this VM store")
 	}
 	d.lock = f
+	d.lifeReader, d.lifeWriter, e = os.Pipe()
+	if e != nil {
+		f.Close()
+		d.lock = nil
+		return e
+	}
 	if e = d.reconcile(); e != nil {
+		d.lifeReader.Close()
+		d.lifeWriter.Close()
 		d.lock.Close()
 		d.lock = nil
 		return e
@@ -249,6 +260,9 @@ func (d *Driver) RecoverTask(handle *drivers.TaskHandle) error {
 	if e != nil {
 		return e
 	}
+	if r.TaskID != handle.Config.ID || r.AllocID != handle.Config.AllocID {
+		return fmt.Errorf("recovery identity mismatch")
+	}
 	if r.CleanupPending {
 		return fmt.Errorf("cleanup required before recovery")
 	}
@@ -366,7 +380,7 @@ func (d *Driver) event(h *taskHandle, phase string) {
 	h.mu.Lock()
 	r := h.r
 	h.mu.Unlock()
-	d.eventer.EmitEvent(&drivers.TaskEvent{TaskID: r.TaskID, TaskName: h.cfg.Name, AllocID: r.AllocID, Timestamp: time.Now(), Message: "Tart build: " + phase, Annotations: map[string]string{"tart.phase": phase, "tart.vm": r.VM, "tart.image": r.Image, "tart.artifact_sha256": r.ArtifactSHA256}})
+	d.eventer.EmitEvent(&drivers.TaskEvent{TaskID: r.TaskID, TaskName: h.cfg.Name, AllocID: r.AllocID, Timestamp: time.Now(), Message: "Tart build: " + phase, Annotations: map[string]string{"tart.phase": phase, "tart.vm": r.VM, "tart.image": r.Image, "tart.artifact_sha256": r.ArtifactSHA256, "tart.artifact": r.Artifact}})
 }
 func (d *Driver) TaskEvents(ctx context.Context) (<-chan *drivers.TaskEvent, error) {
 	return d.eventer.TaskEvents(ctx)
@@ -393,6 +407,14 @@ func (d *Driver) TaskStats(ctx context.Context, id string, interval time.Duratio
 			h.mu.Unlock()
 			if pid > 0 {
 				p, e := process.NewProcess(int32(pid))
+				if e == nil && d.lock != nil {
+					children, err := p.ChildrenWithContext(ctx)
+					if err != nil || len(children) != 1 {
+						e = fmt.Errorf("Tart child unavailable")
+					} else {
+						p = children[0]
+					}
+				}
 				if e == nil {
 					m, me := p.MemoryInfoWithContext(ctx)
 					t, te := p.TimesWithContext(ctx)

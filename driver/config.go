@@ -79,7 +79,7 @@ func (c Config) validate() error {
 }
 
 func (c Config) validateTask(t *drivers.TaskConfig, tc TaskConfig) error {
-	if !c.Enabled || t.Namespace != "canary" || !slices.Contains(c.Jobs, t.JobName) {
+	if !c.Enabled || t.Namespace != "canary" || !slices.Contains(c.Jobs, t.JobID) {
 		return fmt.Errorf("only operator-allowlisted canary jobs are enabled; untrusted execution is unqualified")
 	}
 	if t.User != "" {

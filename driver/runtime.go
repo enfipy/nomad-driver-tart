@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -22,7 +24,20 @@ func (c Config) hostEnv() []string {
 	return []string{"HOME=" + c.StateDir, "TART_HOME=" + filepath.Join(c.StateDir, "vms"), "TART_NO_AUTO_PRUNE=1", "PATH=" + c.SoftnetDir + ":/usr/bin:/bin:/usr/sbin:/sbin", "TMPDIR=" + filepath.Join(c.StateDir, "tmp")}
 }
 func (d *Driver) command(ctx context.Context, args ...string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, d.config.TartPath, args...)
+	var cmd *exec.Cmd
+	if d.lock != nil {
+		executable, err := os.Executable()
+		if err != nil {
+			panic(err)
+		}
+		cmd = exec.CommandContext(ctx, executable, append([]string{"--cloud-tart-child", d.config.TartPath}, args...)...)
+		cmd.ExtraFiles = []*os.File{d.lifeReader, d.lock}
+		// The supervisor handles SIGTERM and reaps the whole process group.
+		cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	} else {
+		cmd = exec.CommandContext(ctx, d.config.TartPath, args...)
+	} // unit fixtures
+
 	cmd.Env = d.config.hostEnv()
 	cmd.Dir = d.config.StateDir
 	cmd.WaitDelay = 5 * time.Second
@@ -50,12 +65,15 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 }
 
 type cappedWriter struct {
+	mu        sync.Mutex
 	w         io.Writer
 	remaining int64
 	cancel    context.CancelFunc
 }
 
 func (w *cappedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if int64(len(p)) > w.remaining {
 		w.cancel()
 		return 0, fmt.Errorf("output limit exceeded")
@@ -166,20 +184,20 @@ func (d *Driver) runTask(h *taskHandle, tc TaskConfig) {
 		d.event(h, r.Phase)
 	}()
 	fail := func(e error) { h.mu.Lock(); h.r.Failure = e.Error(); h.mu.Unlock() }
-	out, e := os.OpenFile(h.cfg.StdoutPath, os.O_WRONLY, 0)
+	out, e := openLog(ctx, h.cfg.StdoutPath)
 	if e != nil {
 		fail(e)
 		return
 	}
 	defer out.Close()
-	errout, e := os.OpenFile(h.cfg.StderrPath, os.O_WRONLY, 0)
+	errout, e := openLog(ctx, h.cfg.StderrPath)
 	if e != nil {
 		fail(e)
 		return
 	}
 	defer errout.Close()
-	stdout := &cappedWriter{out, 64 << 20, h.cancel}
-	stderr := &cappedWriter{errout, 64 << 20, h.cancel}
+	stdout := &cappedWriter{w: logWriter{ctx, out}, remaining: 64 << 20, cancel: h.cancel}
+	stderr := &cappedWriter{w: logWriter{ctx, errout}, remaining: 64 << 20, cancel: h.cancel}
 	if _, e = d.small(ctx, "clone", d.config.Image, h.r.VM); e != nil {
 		fail(e)
 		return
@@ -293,7 +311,7 @@ func (d *Driver) collect(ctx context.Context, h *taskHandle) error {
 	defer os.Remove(path + ".partial")
 	sum := sha256.New()
 	cmd := d.command(ctx, "exec", h.r.VM, "/usr/bin/tar", "-C", "/tmp/cloud-artifacts", "-cf", "-", ".")
-	cmd.Stdout = &cappedWriter{io.MultiWriter(f, sum), d.config.ArtifactMB << 20, h.cancel}
+	cmd.Stdout = &cappedWriter{w: io.MultiWriter(f, sum), remaining: d.config.ArtifactMB << 20, cancel: h.cancel}
 	cmd.Stderr = io.Discard
 	if e = cmd.Run(); e != nil {
 		return fmt.Errorf("artifact export failed: %w", e)
