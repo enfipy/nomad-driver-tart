@@ -271,8 +271,8 @@ case "$1" in
  set) :;;
  list) if test -f "$HOME/vm-name"; then printf '[{"Name":"%s","Source":"local","State":"%s"}]' "$(cat "$HOME/vm-name")" "$(cat "$HOME/vm-state")"; else echo '[]'; fi;;
  run) echo running > "$HOME/vm-state"; echo $$ > "$HOME/vm-pid"; trap 'echo stopped > "$HOME/vm-state"; exit 0' TERM INT; while :; do sleep 0.1; done;;
- stop) if test -f "$HOME/vm-pid"; then kill -TERM "$(cat "$HOME/vm-pid")" 2>/dev/null || true; fi; echo stopped > "$HOME/vm-state";;
- delete) test ! -f "$HOME/fail-delete"; rm -f "$HOME/vm-name" "$HOME/vm-state" "$HOME/vm-pid";;
+ stop) test -f "$HOME/vm-name"; if test -f "$HOME/vm-pid"; then kill -TERM "$(cat "$HOME/vm-pid")" 2>/dev/null || true; fi; echo stopped > "$HOME/vm-state";;
+ delete) test -f "$HOME/vm-name"; test ! -f "$HOME/fail-delete"; rm -f "$HOME/vm-name" "$HOME/vm-state" "$HOME/vm-pid";;
  exec) case "$3" in
   /usr/bin/true) test ! -f "$HOME/not-ready";;
   /usr/bin/tar) printf 'artifact bytes';;
@@ -527,6 +527,15 @@ func TestOrdinaryRecoveryReattachesExecutorWithoutReplay(t *testing.T) {
 		t.Fatal(e)
 	}
 	waitBuildTest(t, d2, cfg.ID)
+	if e = d2.StopTask(cfg.ID, time.Second, "SIGINT"); e != nil {
+		t.Fatal("repeated stop", e)
+	}
+	if e = d2.DestroyTask(cfg.ID, false); e != nil {
+		t.Fatal("destroy after stop", e)
+	}
+	if _, exists := d2.tasks.Get(cfg.ID); exists {
+		t.Fatal("destroy retained handle")
+	}
 	select {
 	case <-original.doneCh:
 	case <-time.After(5 * time.Second):

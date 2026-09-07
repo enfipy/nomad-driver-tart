@@ -95,7 +95,7 @@ func (c *tartCLI) Stop(ctx context.Context, vmName string, gracePeriod time.Dura
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to stop VM %s: %v (stderr: %s)", vmName, err, stderr.String())
+		return c.acceptAbsentVM(ctx, vmName, fmt.Errorf("failed to stop VM %s: %v (stderr: %s)", vmName, err, stderr.String()))
 	}
 
 	return nil
@@ -126,7 +126,7 @@ func (c *tartCLI) Delete(ctx context.Context, vmName string) error {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to delete VM %s: %v (stderr: %s)", vmName, err, stderr.String())
+		return c.acceptAbsentVM(ctx, vmName, fmt.Errorf("failed to delete VM %s: %v (stderr: %s)", vmName, err, stderr.String()))
 	}
 
 	return nil
@@ -181,6 +181,21 @@ func (c *tartCLI) SetVMResources(ctx context.Context, vmName string, cpu, memory
 
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to set resources for VM %s: %v (stderr: %s)", vmName, err, stderr.String())
+	}
+	return nil
+}
+
+// A successful stop may precede DestroyTask or another stop after recovery.
+// Accept an operation error only when Tart independently confirms VM absence.
+func (c *tartCLI) acceptAbsentVM(ctx context.Context, name string, operationErr error) error {
+	vms, err := c.List(ctx)
+	if err != nil {
+		return operationErr
+	}
+	for _, vm := range vms {
+		if vm.Name == name && vm.Source != "oci" {
+			return operationErr
+		}
 	}
 	return nil
 }
