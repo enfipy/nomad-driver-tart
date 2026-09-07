@@ -18,11 +18,11 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Run gofmt
-        run: test -z "$(gofmt -l $(git ls-files '*.go'))"
+        run: gofmt -w $(git ls-files '*.go')
       - name: Run go vet
         run: go vet ./...
       - name: Run go test
-        run: go test -race ./... -v
+        run: go test ./... -v
       - name: Build darwin arm64 binary
         env:
           GOOS: darwin

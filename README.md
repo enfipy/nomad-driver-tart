@@ -1,44 +1,204 @@
-# Nomad Tart driver — cloud qualification fork
+# Nomad Driver for Tart VMs
 
-Fork of brianmichel/nomad-driver-tart, narrowed to disposable macOS builds for
-[cloud #27](https://github.com/enfipy/cloud/issues/27). **Trusted qualification
-only; real Tart/Softnet isolation and restart qualification are still required.**
+<p align="center">
+  <img src="img/nomad-driver-tart-logo.png" width="150" />
+</p>
 
-One operator-pinned image/profile per Apple Silicon Mac; one active VM. Nomad
-reserves the entire configured CPU MHz budget and guest RAM plus overhead. Guest
-vCPU/RAM are set independently. This is not a hard host CPU quota or memory limit.
+A custom task driver for HashiCorp Nomad that enables orchestration and management of [Tart](https://github.com/cirruslabs/tart) virtual machines on macOS.
 
-The task API is `command`, `args`, optional `source` and `artifacts`. All commands
-run through Tart guest-agent RPC. No SSH, shared directories, task user, environment
-forwarding, host/bridged network, forwarded ports or signing credentials. Logs and
-guest exit status go to Nomad. Optional source is `local/source.tar` (at most 1 GiB),
-streamed into `/tmp/cloud-build` in the guest. Artifacts from `/tmp/cloud-artifacts`
-are exported as an opaque bounded tar to task-local storage, with SHA-256 and
-`build-result.json`. Download before allocation GC; no host extraction or durable
-object-store upload. Task events expose phase and artifact metadata.
+## Cloud build profile
 
-Ownership is journaled before clone. Cancellation and every failure converge on
-verified stop/delete. Cleanup failure blocks admission. Plugin restart fails the
-interrupted build and cleans its exact VM; it never replays commands. Same-binary
-helper supervision retains the store lock until old Tart helpers are gone, including
-parent SIGKILL. CPU/RSS samples describe the host Tart process, not guest-used RAM.
+This fork preserves the upstream VM/SSH, networking, disk, registry authentication,
+prewarming and interactive behavior below. An optional **operator-owned `build`
+profile** restricts a Nomad client to trusted disposable build qualification.
+Jobs cannot opt out of the profile. See [build mode](docs/build-mode.md) for
+admission, guest-agent execution, ownership/recovery and the remaining live gates.
 
-Install through [cloud-ctrl](https://github.com/enfipy/cloud). It pins this fork's
-commit, Go compiler, binary digest, Tart and Softnet archives. The driver requires
-an unprivileged dedicated service account, private state and root-owned immutable
-executables. Only Softnet is setuid-root, restricted to the build group. Nomad must
-set `driver.allowlist = "tart"`, disable remote exec, enforce TLS/ACLs, and restrict
-canary submission to trusted operators. A job name or namespace alone is not trust.
+## Overview
 
-Build/test using Go 1.27.0:
+This driver allows Nomad to manage the lifecycle of Tart VMs, providing a way to run macOS virtual machines as Nomad tasks. It integrates with Nomad's ecosystem, enabling users to deploy and manage Tart VMs through Nomad's job specification.
 
-```sh
-go test -race ./...
-CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -buildvcs=false .
+## Video
+
+[![Nomad Driver for Tart VMs](img/nomad-driver-tart-video-thumbnail.png)](https://share.cleanshot.com/S5VmP3fk)
+
+## Features
+
+- Basic task lifecycle management (start, stop, destroy)
+- Task status reporting
+- Signal forwarding to tasks
+- Placeholder for resource usage statistics
+- Startup command execution with output streamed to task logs
+- Control VM CPU and memory via Nomad's `resources` block
+- Optional VM disk size configuration
+ - Networking modes: host-only, bridged, or Softnet with allow/expose
+
+## Requirements
+
+- Go 1.20 or later
+- Nomad 1.6.x or later
+- macOS with Tart installed
+
+## Building
+
+To build the driver plugin:
+
+```bash
+make build
+# Cross compile for Apple Silicon
+GOOS=darwin GOARCH=arm64 make build
 ```
 
-Tests use fake Tart plus real FIFOs/process groups. They establish driver semantics,
-not hypervisor isolation. Live tests must exercise clone/boot/build/export failures,
-plugin/Nomad SIGKILL, host reboot, default-deny network, host/keychain access attempts,
-resource pressure and unrelated-VM preservation. The older upstream task API is unsupported; historical examples are retained
-with an explicit warning. This fork does not provide interactive agents.
+This will create a `nomad-driver-tart` binary in the project root.
+
+## Installation
+
+1. Build the plugin as described above
+2. Place the binary in a directory where Nomad can find it
+3. Configure Nomad to use the plugin (see example configuration below)
+
+## Configuration
+
+For a complete list of all driver and task configuration options, see docs/configuration.md.
+
+### Nomad Agent Configuration
+
+Create or modify your Nomad agent configuration to include the Tart driver plugin:
+
+```hcl
+plugin "nomad-driver-tart" {
+  config {
+    enabled = true
+  }
+}
+
+client {
+  enabled = true
+
+  options {
+    "driver.allowlist" = "tart"
+  }
+}
+```
+
+### Job Specification
+
+Here's an example job specification that uses the Tart driver:
+
+```hcl
+job "macos-sequoia-vanilla" {
+  datacenters = ["dc1"]
+  type        = "service"
+
+  update {
+    max_parallel = 1
+    // Downloading a VM image can take a while as they are
+    // tens of GBs in size. Give our jobs enough grace to
+    // get setup properly.
+    healthy_deadline  = "30m"
+    progress_deadline = "60m"
+  }
+
+  group "vms" {
+    count = 1
+
+    task "vm" {
+      driver = "tart"
+
+      # Setup password with a secure Nomad var
+      # Example:
+      #   nomad var put nomad/jobs/macos-sequoia-vanilla ssh_password="your VM password"
+      template {
+        data        = <<EOH
+SSH_PASSWORD={{ with nomadVar "nomad/jobs/macos-sequoia-vanilla" }}{{ .ssh_password }}{{ end }}
+EOH
+        destination = "secrets/file.env"
+        env         = true
+      }
+
+      config {
+        url          = "ghcr.io/cirruslabs/macos-sequoia-vanilla:latest"
+        ssh_user     = "admin"
+        ssh_password = "${SSH_PASSWORD}"
+        # Whether or not to show the built-in Tart UI for the VM
+        # Defaults to false
+        show_ui      = true
+        # Optional resource configuration for the VM
+        # disk_size is the desired disk size in gigabytes
+        disk_size  = 60
+
+        # Networking (mutually exclusive modes)
+        # Default is shared/NAT (no option needed)
+        # network {
+        #   mode = "host"         # or "bridged" | "softnet" | "shared"
+        #   bridged_interface = "en0"   # required when mode = "bridged"
+        #   softnet_allow  = ["192.168.0.0/24"]
+        #   softnet_expose = ["2222:22", "8080:80"]
+        # }
+      }
+
+      resources {
+        cpu    = 500   # Number of virtual CPU shares (1 core = 1000)
+        memory = 256  # Memory in MB assigned to the VM
+      }
+
+      logs {
+        max_files     = 3
+        max_file_size = 10
+      }
+    }
+  }
+}
+```
+
+## Usage
+
+1. Start the Nomad agent with the plugin:
+
+```bash
+nomad agent -dev -config=./examples/agent.hcl -plugin-dir=$(pwd)
+```
+
+2. In another terminal, run a job that uses the Tart driver:
+
+```bash
+nomad run ./examples/example.nomad.hcl
+```
+
+Additional examples:
+- `examples/prewarm.nomad.hcl` — pre-pull a Tart image onto clients
+- `examples/cursor-self-hosted-worker.nomad.hcl` — install and start a Cursor personal self-hosted worker inside a macOS VM
+
+3. Check the status of the job and get the allocation ID:
+
+```bash
+nomad status
+```
+
+4. View the logs from the task:
+
+```bash
+nomad logs <ALLOCATION_ID>
+```
+
+## Development
+
+This driver is currently in development and provides basic functionality. Future enhancements may include:
+
+- Proper Tart VM lifecycle management
+- Resource isolation and management
+- Network configuration
+  - Bridged, host-only, and Softnet options
+- Volume mounts
+- Health checking
+
+### Continuous Integration
+
+A GitHub Actions workflow automatically formats, vets, and builds the driver for darwin/arm64 on every pull request and push to `main`. Releases are handled by a separate workflow that runs [GoReleaser](https://goreleaser.com/) whenever a tag starting with `v` is pushed. The release workflow can also be manually triggered to produce a snapshot from any commit.
+
+
+## License
+
+See [LICENSE](LICENSE) file.
+
+Tart's [LICENSE](https://github.com/cirruslabs/tart/blob/main/LICENSE) still applies to your usage of the underlying program.

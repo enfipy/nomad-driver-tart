@@ -11,10 +11,13 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	pstructs "github.com/hashicorp/nomad/plugins/shared/structs"
 )
 
-type record struct {
+type buildRecord struct {
 	Schema                     int
+	Reattach                   *pstructs.ReattachConfig
 	TaskID, AllocID, VM, Image string
 	Started                    time.Time
 	Finished                   time.Time
@@ -27,14 +30,14 @@ type record struct {
 }
 
 func taskKey(id string) string { sum := sha256.Sum256([]byte(id)); return hex.EncodeToString(sum[:]) }
-func newRecord(id, alloc, image string) record {
+func newRecord(id, alloc, image string) buildRecord {
 	var nonce [8]byte
 	if _, e := rand.Read(nonce[:]); e != nil {
 		panic(e)
 	}
-	return record{Schema: 1, TaskID: id, AllocID: alloc, VM: "cloud-" + taskKey(id)[:24] + "-" + hex.EncodeToString(nonce[:]), Image: image, Started: time.Now(), Phase: "preparing", ExitCode: -1, CleanupPending: true}
+	return buildRecord{Schema: 1, TaskID: id, AllocID: alloc, VM: "cloud-" + taskKey(id)[:24] + "-" + hex.EncodeToString(nonce[:]), Image: image, Started: time.Now(), Phase: "preparing", ExitCode: -1, CleanupPending: true}
 }
-func (r record) validate(key string) error {
+func (r buildRecord) validate(key string) error {
 	if r.Schema != 1 || key != taskKey(r.TaskID) || !strings.HasPrefix(r.VM, "cloud-"+key[:24]+"-") || len(r.VM) != 47 || !nameToken.MatchString(r.VM) || !digestImage.MatchString(r.Image) {
 		return fmt.Errorf("invalid owned VM record")
 	}
@@ -117,11 +120,11 @@ func writeAtomic(path string, v any) error {
 	return d.Sync()
 }
 func (d *Driver) recordPath(id string) string {
-	return filepath.Join(d.config.StateDir, "records", taskKey(id)+".json")
+	return filepath.Join(d.config.Build.StateDir, "records", taskKey(id)+".json")
 }
-func (d *Driver) save(r record) error { return writeAtomic(d.recordPath(r.TaskID), r) }
-func readRecord(path string) (record, error) {
-	var r record
+func (d *Driver) save(r buildRecord) error { return writeAtomic(d.recordPath(r.TaskID), r) }
+func readRecord(path string) (buildRecord, error) {
+	var r buildRecord
 	f, e := openRegular(path, 65536)
 	if e != nil {
 		return r, e

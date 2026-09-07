@@ -1,5 +1,3 @@
-# Legacy upstream example: unsupported by the cloud qualification fork.
-# Use the qualification contract in README.md and cloud-ctrl generated jobs.
 // Pre-pull a Tart image onto selected Nomad clients so that subsequent
 // VM-running tasks can skip the registry download.
 //
