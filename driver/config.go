@@ -1,111 +1,120 @@
 package driver
 
-import "github.com/hashicorp/nomad/plugins/shared/hclspec"
+import (
+	"fmt"
+	"net/netip"
+	"path/filepath"
+	"regexp"
+	"slices"
 
-// Config is the driver configuration set by the SetConfig RPC call
-type Config struct {
-	// Enabled is set to true to enable the tart driver
-	Enabled bool `codec:"enabled"`
-}
-
-// TaskConfig is the driver configuration of a task within a job
-type TaskConfig struct {
-	URL         string `codec:"url"`
-	SSHUser     string `codec:"ssh_user"`
-	SSHPassword string `codec:"ssh_password"`
-	ShowUI      bool   `codec:"show_ui"`
-	// DiskSize is the desired disk size of the VM in gigabytes. Setting this
-	// to zero will leave the disk size unchanged.
-	DiskSize int  `codec:"disk_size"`
-	Auth     Auth `codec:"auth"`
-
-	// PullOnly, when true, turns the task into a short-lived image prefetch:
-	// the driver runs `tart pull <url>` on the client to populate the local
-	// OCI cache and then exits. No VM is created, started, or deleted.
-	// Typically scheduled as a sysbatch job with a client constraint to
-	// pre-warm a fleet of Nomad clients.
-	PullOnly bool `codec:"pull_only"`
-
-	// Network contains networking options for the VM
-	Network *NetworkConfig `codec:"network"`
-
-	// Root disk options on how to configure the VM
-	RootDisk *RootDiskOptions `codec:"root_disk"`
-
-	// Directories is a blocklist of host directories to mount into the VM
-	Directories []DirectoryMount `codec:"directory"`
-
-	// Command is an optional command to run inside the VM after the VM
-	// boots and SSH becomes reachable. Output is streamed to the task's
-	// stdout/stderr. The VM is left running regardless of exit status.
-	Command string `codec:"command"`
-	// Args are optional arguments passed to Command.
-	Args []string `codec:"args"`
-}
-
-type Auth struct {
-	Username string `codec:"username"`
-	Password string `codec:"password"`
-}
-
-func (a Auth) IsValid() bool {
-	return a.Username != "" && a.Password != ""
-}
-
-var (
-	// configSpec is the hcl specification returned by the ConfigSchema RPC
-	configSpec = hclspec.NewObject(map[string]*hclspec.Spec{
-		// Config options can be specified here
-		"enabled": hclspec.NewDefault(
-			hclspec.NewAttr("enabled", "bool", false),
-			hclspec.NewLiteral("true"),
-		),
-	})
-
-	// taskConfigSpec is the hcl specification for the driver config section of
-	// a task within a job. It is returned in the TaskConfigSchema RPC
-	taskConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
-		"url": hclspec.NewAttr("url", "string", true),
-		// ssh_user / ssh_password are required for normal (VM-running) tasks
-		// but not for pull_only tasks; this is enforced in the driver at
-		// StartTask time rather than by the schema.
-		"ssh_user":     hclspec.NewAttr("ssh_user", "string", false),
-		"ssh_password": hclspec.NewAttr("ssh_password", "string", false),
-		"show_ui":      hclspec.NewDefault(hclspec.NewAttr("show_ui", "bool", false), hclspec.NewLiteral("false")),
-		"disk_size":    hclspec.NewAttr("disk_size", "number", false),
-		"pull_only":    hclspec.NewDefault(hclspec.NewAttr("pull_only", "bool", false), hclspec.NewLiteral("false")),
-		"auth": hclspec.NewBlock("auth", false, hclspec.NewObject(map[string]*hclspec.Spec{
-			"username": hclspec.NewAttr("username", "string", true),
-			"password": hclspec.NewAttr("password", "string", true),
-		})),
-
-		// Networking options block
-		// mode: "host" | "bridged" | "softnet" | "shared" (default)
-		// softnet_allow/expose imply softnet when mode is not specified
-		"network": hclspec.NewBlock("network", false, hclspec.NewObject(map[string]*hclspec.Spec{
-			"mode":              hclspec.NewAttr("mode", "string", false),
-			"bridged_interface": hclspec.NewAttr("bridged_interface", "string", false),
-			"softnet_allow":     hclspec.NewAttr("softnet_allow", "list(string)", false),
-			"softnet_expose":    hclspec.NewAttr("softnet_expose", "list(string)", false),
-		})),
-
-		// Root disk options block
-		"root_disk": hclspec.NewBlock("root_disk", false, hclspec.NewObject(map[string]*hclspec.Spec{
-			"readonly":     hclspec.NewDefault(hclspec.NewAttr("readonly", "bool", false), hclspec.NewLiteral("false")),
-			"caching_mode": hclspec.NewAttr("caching_mode", "string", false),
-			"sync_mode":    hclspec.NewAttr("sync_mode", "string", false),
-		})),
-
-		"command": hclspec.NewAttr("command", "string", false),
-		"args":    hclspec.NewAttr("args", "list(string)", false),
-
-		"directory": hclspec.NewBlockList("directory", hclspec.NewObject(map[string]*hclspec.Spec{
-			"name": hclspec.NewAttr("name", "string", true),
-			"path": hclspec.NewAttr("path", "string", true),
-			"options": hclspec.NewBlock("options", false, hclspec.NewObject(map[string]*hclspec.Spec{
-				"readonly": hclspec.NewAttr("readonly", "bool", true),
-				"tag":      hclspec.NewAttr("tag", "string", false),
-			})),
-		})),
-	})
+	"github.com/hashicorp/nomad/plugins/drivers"
+	"github.com/hashicorp/nomad/plugins/shared/hclspec"
 )
+
+// Config is operator-owned. Tasks cannot override host paths, identity, image,
+// network policy or VM size. Initially only named qualification jobs are admitted.
+type Config struct {
+	Enabled        bool     `codec:"enabled"`
+	TartPath       string   `codec:"tart_path"`
+	SoftnetDir     string   `codec:"softnet_dir"`
+	StateDir       string   `codec:"state_dir"`
+	Image          string   `codec:"image"`
+	Xcode          string   `codec:"xcode"`
+	CPU            int64    `codec:"cpu_mhz"`
+	VCPUs          int      `codec:"vcpus"`
+	MemoryMB       int64    `codec:"memory_mb"`
+	OverheadMB     int64    `codec:"overhead_mb"`
+	TimeoutSeconds int      `codec:"timeout_seconds"`
+	ArtifactMB     int64    `codec:"artifact_mb"`
+	Allow          []string `codec:"network_allow"`
+	Block          []string `codec:"network_block"`
+	Jobs           []string `codec:"qualification_jobs"`
+}
+
+type TaskConfig struct {
+	Command string   `codec:"command"`
+	Args    []string `codec:"args"`
+	// Both are guest-relative paths. No host mounts, task user or guest secrets.
+	Source    bool `codec:"source"`
+	Artifacts bool `codec:"artifacts"`
+}
+
+var digestImage = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:/-]*@sha256:[a-f0-9]{64}$`)
+var nameToken = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`)
+
+func (c Config) validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	for _, p := range []string{c.TartPath, c.SoftnetDir, c.StateDir} {
+		if !filepath.IsAbs(p) || filepath.Clean(p) != p {
+			return fmt.Errorf("absolute canonical operator paths required")
+		}
+	}
+	if !digestImage.MatchString(c.Image) || c.VCPUs < 1 || c.VCPUs > 64 || c.CPU < 1 || c.MemoryMB < 4096 || c.OverheadMB < 512 || c.TimeoutSeconds < 1 || c.TimeoutSeconds > 86400 || c.ArtifactMB < 1 || c.ArtifactMB > 16384 || len(c.Jobs) == 0 {
+		return fmt.Errorf("invalid pinned image, resource profile or qualification allowlist")
+	}
+	for _, j := range c.Jobs {
+		if !nameToken.MatchString(j) {
+			return fmt.Errorf("invalid qualification job")
+		}
+	}
+	if !slices.Contains(c.Block, "0.0.0.0/0") || !slices.Contains(c.Block, "@host") {
+		return fmt.Errorf("default deny and @host block required")
+	}
+	for _, list := range [][]string{c.Allow, c.Block} {
+		for _, s := range list {
+			if s == "@host" && slices.Contains(c.Block, s) {
+				continue
+			}
+			prefix, e := netip.ParsePrefix(s)
+			if e != nil || !prefix.Addr().Is4() {
+				return fmt.Errorf("IPv4 CIDRs required")
+			}
+		}
+	}
+	// An allowlist is intentionally operator-maintained. Include all private,
+	// tailnet, link-local and host public addresses in more-specific block rules.
+	return nil
+}
+
+func (c Config) validateTask(t *drivers.TaskConfig, tc TaskConfig) error {
+	if !c.Enabled || t.Namespace != "canary" || !slices.Contains(c.Jobs, t.JobName) {
+		return fmt.Errorf("only operator-allowlisted canary jobs are enabled; untrusted execution is unqualified")
+	}
+	if t.User != "" {
+		return fmt.Errorf("task user overrides are forbidden")
+	}
+	if tc.Command == "" || len(tc.Args) > 128 {
+		return fmt.Errorf("guest command required")
+	}
+	r := t.Resources
+	if r == nil || r.NomadResources == nil || r.NomadResources.Cpu.CpuShares != c.CPU || r.NomadResources.Memory.MemoryMB != c.MemoryMB+c.OverheadMB || r.NomadResources.Memory.MemoryMaxMB > r.NomadResources.Memory.MemoryMB || len(r.NomadResources.Cpu.ReservedCores) != 0 {
+		return fmt.Errorf("task must reserve the complete CPU budget and guest RAM plus overhead; no cores or oversubscription")
+	}
+	return nil
+}
+
+var configSpec = hclspec.NewObject(map[string]*hclspec.Spec{
+	"enabled":            hclspec.NewAttr("enabled", "bool", true),
+	"tart_path":          hclspec.NewAttr("tart_path", "string", true),
+	"softnet_dir":        hclspec.NewAttr("softnet_dir", "string", true),
+	"state_dir":          hclspec.NewAttr("state_dir", "string", true),
+	"image":              hclspec.NewAttr("image", "string", true),
+	"xcode":              hclspec.NewAttr("xcode", "string", true),
+	"cpu_mhz":            hclspec.NewAttr("cpu_mhz", "number", true),
+	"vcpus":              hclspec.NewAttr("vcpus", "number", true),
+	"memory_mb":          hclspec.NewAttr("memory_mb", "number", true),
+	"overhead_mb":        hclspec.NewAttr("overhead_mb", "number", true),
+	"timeout_seconds":    hclspec.NewAttr("timeout_seconds", "number", true),
+	"artifact_mb":        hclspec.NewAttr("artifact_mb", "number", true),
+	"network_allow":      hclspec.NewAttr("network_allow", "list(string)", true),
+	"network_block":      hclspec.NewAttr("network_block", "list(string)", true),
+	"qualification_jobs": hclspec.NewAttr("qualification_jobs", "list(string)", true),
+})
+var taskConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
+	"command":   hclspec.NewAttr("command", "string", true),
+	"args":      hclspec.NewAttr("args", "list(string)", false),
+	"source":    hclspec.NewAttr("source", "bool", false),
+	"artifacts": hclspec.NewAttr("artifacts", "bool", false),
+})
