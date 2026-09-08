@@ -56,3 +56,5 @@ Virtualization.framework helper memory. Live VM isolation, hardware accounting,
 launchd/reboot and signed Xcode/Bevy image readiness remain qualification gates.
 Tests use fake Tart, real process/FIFO behavior and Nomad's executor; they do not
 establish hypervisor isolation. See [cloud #27](https://github.com/enfipy/cloud/issues/27).
+
+The build profile rejects an all-address `/0` allow rule because Softnet uses it to disable bridge isolation, even alongside a `/0` block. Allow specific destinations and keep private, tailnet, gateway and host-public addresses blocked.

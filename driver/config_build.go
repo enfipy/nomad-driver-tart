@@ -55,7 +55,7 @@ func (c BuildConfig) validate() error {
 	if !slices.Contains(c.Block, "0.0.0.0/0") || !slices.Contains(c.Block, "@host") {
 		return fmt.Errorf("default deny and @host block required")
 	}
-	for _, list := range [][]string{c.Allow, c.Block} {
+	for index, list := range [][]string{c.Allow, c.Block} {
 		for _, s := range list {
 			if s == "@host" && slices.Contains(c.Block, s) {
 				continue
@@ -63,6 +63,10 @@ func (c BuildConfig) validate() error {
 			prefix, e := netip.ParsePrefix(s)
 			if e != nil || !prefix.Addr().Is4() {
 				return fmt.Errorf("IPv4 CIDRs required")
+			}
+			// Softnet treats an all-address allow as disabling bridge isolation.
+			if index == 0 && prefix.Bits() == 0 {
+				return fmt.Errorf("all-address allow disables Softnet bridge isolation")
 			}
 		}
 	}

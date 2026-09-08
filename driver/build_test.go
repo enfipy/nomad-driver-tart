@@ -588,3 +588,13 @@ func TestStopRecoveredBuildIsIdempotent(t *testing.T) {
 		t.Fatal(e)
 	}
 }
+
+func TestBuildRejectsSoftnetBridgeIsolationOverride(t *testing.T) {
+	d, _ := buildFixture(t)
+	for _, allow := range []string{"0.0.0.0/0", "192.168.1.1/0"} {
+		d.config.Build.Allow = []string{allow}
+		if e := d.config.Build.validate(); e == nil || !strings.Contains(e.Error(), "bridge isolation") {
+			t.Fatalf("accepted %q: %v", allow, e)
+		}
+	}
+}
