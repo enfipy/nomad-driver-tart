@@ -14,6 +14,7 @@ Cloud-ctrl generates and signs the profile. Required fields inside `build`:
 | `state_dir` | Private service-owned directory, independent of personal Tart stores. |
 | `image`, `xcode` | Immutable image digest and expected Xcode version; declarations are not proof. |
 | `cpu_mhz`, `vcpus`, `memory_mb`, `overhead_mb` | Complete schedulable MHz budget, guest size and host overhead. Task reserves exactly MHz and memory+overhead; no CPU cores or memory oversubscription. |
+| `image_disk_mb`, `min_free_disk_mb` | Operator-attested uncompressed image size and free-space reserve (MiB). Admission adds the image budget only for an uncached pull. A one-second free-space monitor cancels through normal cleanup below the reserve; this is not a hard storage quota. Automatic pruning is disabled. |
 | `timeout_seconds`, `artifact_mb` | Whole-build deadline and bounded artifact archive. Guest logs are limited to 64 MiB per stream. |
 | `network_allow`, `network_block` | Operator IPv4 CIDRs. Blocks must include `0.0.0.0/0` and `@host`; no port exposure. |
 | `qualification_jobs` | Explicit job IDs accepted only in `canary`. Submit ACLs must be trusted-operator-only. |

@@ -25,6 +25,8 @@ type BuildConfig struct {
 	OverheadMB     int64    `codec:"overhead_mb"`
 	TimeoutSeconds int      `codec:"timeout_seconds"`
 	ArtifactMB     int64    `codec:"artifact_mb"`
+	ImageDiskMB    int64    `codec:"image_disk_mb"`
+	MinFreeDiskMB  int64    `codec:"min_free_disk_mb"`
 	Allow          []string `codec:"network_allow"`
 	Block          []string `codec:"network_block"`
 	Jobs           []string `codec:"qualification_jobs"`
@@ -34,6 +36,9 @@ var digestImage = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:/-]*@sha256:[a-f0
 var nameToken = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`)
 
 func (c BuildConfig) validate() error {
+	if c.ImageDiskMB < 1 || c.ImageDiskMB > 16*1024*1024 || c.MinFreeDiskMB < 1024 || c.MinFreeDiskMB > 16*1024*1024 {
+		return fmt.Errorf("bounded image disk size and free-space reserve required")
+	}
 	for _, p := range []string{c.TartPath, c.SoftnetDir, c.StateDir} {
 		if !filepath.IsAbs(p) || filepath.Clean(p) != p {
 			return fmt.Errorf("absolute canonical operator paths required")
@@ -98,6 +103,8 @@ var buildConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
 	"overhead_mb":        hclspec.NewAttr("overhead_mb", "number", true),
 	"timeout_seconds":    hclspec.NewAttr("timeout_seconds", "number", true),
 	"artifact_mb":        hclspec.NewAttr("artifact_mb", "number", true),
+	"image_disk_mb":      hclspec.NewAttr("image_disk_mb", "number", true),
+	"min_free_disk_mb":   hclspec.NewAttr("min_free_disk_mb", "number", true),
 	"network_allow":      hclspec.NewAttr("network_allow", "list(string)", true),
 	"network_block":      hclspec.NewAttr("network_block", "list(string)", true),
 	"qualification_jobs": hclspec.NewAttr("qualification_jobs", "list(string)", true),

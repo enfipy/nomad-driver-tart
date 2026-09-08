@@ -177,8 +177,21 @@ func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drive
 		ctx, cancel := context.WithTimeout(d.ctx, time.Duration(vm.Build.TimeoutSeconds)*time.Second)
 		h.startupCancel = cancel
 		h.shutdown = cancel
-		h.launch = func() error { return d.launchTask(ctx, h, handle) }
-		h.finish = func(result *drivers.ExitResult) *drivers.ExitResult { return d.finishBuild(h, result) }
+		diskDone := make(chan struct{})
+		h.launch = func() error {
+			go func() {
+				defer close(diskDone)
+				if e := monitorDisk(ctx, time.Second, uint64(vm.Build.MinFreeDiskMB)*1024*1024, func() (uint64, error) { return freeDisk(vm.Build.StateDir) }); e != nil {
+					h.failBuild(e)
+					cancel()
+				}
+			}()
+			return d.launchTask(ctx, h, handle)
+		}
+		h.finish = func(result *drivers.ExitResult) *drivers.ExitResult {
+			<-diskDone
+			return d.finishBuild(h, result)
+		}
 		if e := handle.SetDriverState(&driverState{TaskConfig: cfg, StartedAt: h.startedAt, VMName: vm.Name, Build: true}); e != nil {
 			return nil, nil, e
 		}
@@ -207,6 +220,15 @@ func (d *Driver) launchTask(ctx context.Context, h *taskHandle, handle *drivers.
 	needsDownload, e := d.client.NeedsImageDownload(ctx, vm)
 	if e != nil {
 		return e
+	}
+	if vm.Build != nil {
+		available, e := freeDisk(vm.Build.StateDir)
+		if e != nil {
+			return e
+		}
+		if e = vm.Build.checkDisk(available, needsDownload); e != nil {
+			return e
+		}
 	}
 	if needsDownload {
 		d.emitTaskEvent(cfg, "Downloading VM image", map[string]string{"url": vm.Driver.URL})

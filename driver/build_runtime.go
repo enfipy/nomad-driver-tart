@@ -336,7 +336,7 @@ func (d *Driver) waitForGuestAgent(ctx context.Context, vm VMConfig) error {
 	}
 }
 func (d *Driver) executeBuild(ctx context.Context, h *taskHandle) {
-	fail := func(e error) { h.stateLock.Lock(); h.build.Failure = e.Error(); h.stateLock.Unlock() }
+	fail := h.failBuild
 	out, e := openLog(ctx, h.taskConfig.StdoutPath)
 	if e != nil {
 		fail(e)
@@ -471,4 +471,13 @@ func (d *Driver) buildStats(ctx context.Context, h *taskHandle, interval time.Du
 		}
 	}()
 	return ch, nil
+}
+
+// Preserve the initiating error when cancellation produces secondary failures.
+func (h *taskHandle) failBuild(e error) {
+	h.stateLock.Lock()
+	defer h.stateLock.Unlock()
+	if h.build.Failure == "" {
+		h.build.Failure = e.Error()
+	}
 }

@@ -30,7 +30,7 @@ func buildFixture(t *testing.T) (*Driver, *drivers.TaskConfig) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	c := BuildConfig{TartPath: filepath.Join(root, "tart"), SoftnetDir: root, StateDir: root, Image: "ghcr.io/test/image@sha256:" + strings.Repeat("a", 64), Xcode: "26.5", CPU: 20000, VCPUs: 4, MemoryMB: 8192, OverheadMB: 1024, TimeoutSeconds: 30, ArtifactMB: 1, Jobs: []string{"qualify"}, Block: []string{"0.0.0.0/0", "@host"}}
+	c := BuildConfig{TartPath: filepath.Join(root, "tart"), SoftnetDir: root, StateDir: root, Image: "ghcr.io/test/image@sha256:" + strings.Repeat("a", 64), Xcode: "26.5", CPU: 20000, VCPUs: 4, MemoryMB: 8192, OverheadMB: 1024, TimeoutSeconds: 30, ArtifactMB: 1, ImageDiskMB: 1, MinFreeDiskMB: 1024, Jobs: []string{"qualify"}, Block: []string{"0.0.0.0/0", "@host"}}
 	for _, p := range []string{"records", "vms", "tmp", "alloc/build/local"} {
 		if e = os.MkdirAll(filepath.Join(root, p), 0700); e != nil {
 			t.Fatal(e)
@@ -406,7 +406,7 @@ func TestBuildProfilePreservesOrdinaryConfiguration(t *testing.T) {
 }
 func TestBuildProfileHCLAndOverrideDenials(t *testing.T) {
 	d, cfg := buildFixture(t)
-	raw := `config { enabled=true build { tart_path="/opt/tart" softnet_dir="/opt" state_dir="/private/var/lib/build" image="ghcr.io/test/image@sha256:` + strings.Repeat("a", 64) + `" xcode="26.5" cpu_mhz=20000 vcpus=4 memory_mb=8192 overhead_mb=1024 timeout_seconds=30 artifact_mb=1 network_allow=[] network_block=["0.0.0.0/0","@host"] qualification_jobs=["qualify"] } }`
+	raw := `config { enabled=true build { tart_path="/opt/tart" softnet_dir="/opt" state_dir="/private/var/lib/build" image="ghcr.io/test/image@sha256:` + strings.Repeat("a", 64) + `" xcode="26.5" cpu_mhz=20000 vcpus=4 memory_mb=8192 overhead_mb=1024 timeout_seconds=30 artifact_mb=1 image_disk_mb=133515 min_free_disk_mb=32768 network_allow=[] network_block=["0.0.0.0/0","@host"] qualification_jobs=["qualify"] } }`
 	var decoded Config
 	hclutils.NewConfigParser(configSpec).ParseHCL(t, raw, &decoded)
 	if decoded.Build == nil {
