@@ -285,8 +285,8 @@ func (d *Driver) launchTask(ctx context.Context, h *taskHandle, handle *drivers.
 	if vm.Build != nil {
 		ec.Env = vm.Build.hostEnv()
 		ec.TaskDir = vm.Build.StateDir
-		ec.StdoutPath = os.DevNull
-		ec.StderrPath = os.DevNull
+		// Keep VM startup diagnostics in Nomad's rotating task logs alongside
+		// guest output; an early Tart exit otherwise loses its actual cause.
 		ec.NetworkIsolation = nil
 	}
 	if e = ctx.Err(); e != nil {

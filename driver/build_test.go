@@ -156,6 +156,25 @@ func TestBuildExitArtifactsAndHostEnvironment(t *testing.T) {
 		t.Fatal(e)
 	}
 }
+
+func TestBuildVMStartupFailureKeepsDiagnostics(t *testing.T) {
+	d, cfg := buildFixture(t)
+	script := strings.Replace(fakeTart, "run) echo running", "run) echo 'VM startup diagnostic' >&2; exit 42; echo running", 1)
+	if e := os.WriteFile(d.config.Build.TartPath, []byte(script), 0700); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.WriteFile(filepath.Join(d.config.Build.StateDir, "not-ready"), nil, 0600); e != nil {
+		t.Fatal(e)
+	}
+	startBuildTest(t, d, cfg, "/guest/ok")
+	if r := waitBuildTest(t, d, cfg.ID); r.Err == nil {
+		t.Fatal("VM failure reported success")
+	}
+	stderr, e := os.ReadFile(cfg.StderrPath)
+	if e != nil || !strings.Contains(string(stderr), "VM startup diagnostic") {
+		t.Fatalf("VM startup diagnostics lost: %q %v", stderr, e)
+	}
+}
 func TestAdmissionAndResourceValidation(t *testing.T) {
 	d, cfg := buildFixture(t)
 	if e := d.config.Build.validate(); e != nil {
