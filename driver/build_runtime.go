@@ -282,6 +282,14 @@ func (d *Driver) finishBuild(h *taskHandle, exited *drivers.ExitResult) *drivers
 		r.CleanupPending = true
 		r.Phase = "cleanup_pending"
 	}
+	if e := publishBuildResult(h.taskConfig, r); e != nil {
+		r.Failure = strings.TrimPrefix(r.Failure+"; publishing build result: "+e.Error(), "; ")
+		if e = d.save(r); e != nil {
+			r.Failure += "; persisting terminal state: " + e.Error()
+			r.CleanupPending = true
+			r.Phase = "cleanup_pending"
+		}
+	}
 	h.stateLock.Lock()
 	*h.build = r
 	h.stateLock.Unlock()
@@ -418,7 +426,7 @@ func (d *Driver) collectBuild(ctx context.Context, h *taskHandle) error {
 	h.build.ArtifactSHA256 = hex.EncodeToString(sum.Sum(nil))
 	r := *h.build
 	h.stateLock.Unlock()
-	return writeAtomic(filepath.Join(dir, "build-result.json"), r)
+	return d.save(r)
 }
 
 // Executor stats remain the normal-mode API. Build samples explicitly report
@@ -480,4 +488,12 @@ func (h *taskHandle) failBuild(e error) {
 	if h.build.Failure == "" {
 		h.build.Failure = e.Error()
 	}
+}
+
+func publishBuildResult(cfg *drivers.TaskConfig, r buildRecord) error {
+	dir := cfg.TaskDir().LocalDir
+	if e := safeDir(dir); e != nil {
+		return e
+	}
+	return writeAtomic(filepath.Join(dir, "build-result.json"), r)
 }

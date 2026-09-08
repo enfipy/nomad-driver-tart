@@ -408,6 +408,9 @@ func (d *Driver) RecoverTask(h *drivers.TaskHandle) error {
 		if r.AllocID != h.Config.AllocID || r.CleanupPending {
 			return fmt.Errorf("cleanup required or identity mismatch")
 		}
+		if e := publishBuildResult(h.Config, r); e != nil {
+			return fmt.Errorf("publishing recovered build result: %w", e)
+		}
 		th := &taskHandle{taskConfig: h.Config, build: &r, state: drivers.TaskStateExited, startedAt: r.Started, completedAt: r.Finished, exitResult: buildResult(r), doneCh: make(chan struct{})}
 		close(th.doneCh)
 		d.tasks.Set(h.Config.ID, th)

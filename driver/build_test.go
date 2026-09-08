@@ -136,6 +136,14 @@ func TestBuildExitArtifactsAndHostEnvironment(t *testing.T) {
 	if e != nil || string(bytes) != "artifact bytes" {
 		t.Fatalf("artifact: %q %v", bytes, e)
 	}
+	var published buildRecord
+	resultBytes, e := os.ReadFile(filepath.Join(cfg.TaskDir().LocalDir, "build-result.json"))
+	if e == nil {
+		e = json.Unmarshal(resultBytes, &published)
+	}
+	if e != nil || published.Phase != "complete" || published.Finished.IsZero() || published.ExitCode != 7 || published.CleanupPending {
+		t.Fatalf("downloadable result is not terminal: %+v %v", published, e)
+	}
 	hostenv, _ := os.ReadFile(filepath.Join(d.config.Build.StateDir, "environment"))
 	if strings.Contains(string(hostenv), "secret") || strings.Contains(string(hostenv), "/evil") {
 		t.Fatal("task environment reached host")
@@ -218,8 +226,17 @@ func TestRecoveryDoesNotReplayAndUnknownRecordFailsClosed(t *testing.T) {
 	if result.Err == nil || result.ExitCode != -1 {
 		t.Fatalf("interrupted build became success: %+v", result)
 	}
+	b, e := os.ReadFile(filepath.Join(cfg.TaskDir().LocalDir, "build-result.json"))
+	var published buildRecord
+	if e == nil {
+		e = json.Unmarshal(b, &published)
+	}
+	if e != nil || published.Phase != "complete" || published.ExitCode != -1 || !strings.Contains(published.Failure, "interrupted") {
+		t.Fatalf("missing recovered terminal result: %+v %v", published, e)
+	}
+
 	r.VM = "user-vm"
-	b, _ := json.Marshal(r)
+	b, _ = json.Marshal(r)
 	os.WriteFile(d.recordPath(cfg.ID), b, 0600)
 	if e := d.reconcileBuilds(); e == nil {
 		t.Fatal("foreign VM record accepted")
@@ -596,5 +613,30 @@ func TestBuildRejectsSoftnetBridgeIsolationOverride(t *testing.T) {
 		if e := d.config.Build.validate(); e == nil || !strings.Contains(e.Error(), "bridge isolation") {
 			t.Fatalf("accepted %q: %v", allow, e)
 		}
+	}
+}
+
+func TestResultPublicationFailurePreservesCleanupAndAdmission(t *testing.T) {
+	d, cfg := buildFixture(t)
+	if e := os.Mkdir(filepath.Join(cfg.TaskDir().LocalDir, "build-result.json"), 0700); e != nil {
+		t.Fatal(e)
+	}
+	startBuildTest(t, d, cfg, "/guest/ok")
+	result := waitBuildTest(t, d, cfg.ID)
+	if result.Err == nil || !strings.Contains(result.Err.Error(), "publishing build result") {
+		t.Fatalf("publication failure hidden: %+v", result)
+	}
+	r, e := readRecord(d.recordPath(cfg.ID))
+	if e != nil || r.CleanupPending || !strings.Contains(r.Failure, "publishing build result") {
+		t.Fatalf("incorrect journal: %+v %v", r, e)
+	}
+	if _, e := os.Stat(filepath.Join(d.config.Build.StateDir, "vm-name")); !os.IsNotExist(e) {
+		t.Fatal("VM survived result publication failure")
+	}
+	d.admission.Lock()
+	busy := d.build.busy
+	d.admission.Unlock()
+	if busy {
+		t.Fatal("completed cleanup left admission blocked")
 	}
 }
