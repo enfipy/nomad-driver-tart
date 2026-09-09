@@ -438,6 +438,10 @@ func (d *Driver) buildStats(ctx context.Context, h *taskHandle, interval time.Du
 	go func() {
 		defer close(ch)
 		var counter buildUsageCounter
+		if d.nomadConfig != nil && d.nomadConfig.Topology != nil {
+			counter.compute = d.nomadConfig.Topology.Compute()
+		}
+		unavailable := false
 		for {
 			select {
 			case <-ctx.Done():
@@ -450,6 +454,7 @@ func (d *Driver) buildStats(ctx context.Context, h *taskHandle, interval time.Du
 			pid, started := h.pid, h.startedAt
 			h.stateLock.RUnlock()
 			if pid > 0 {
+				sampled := false
 				sampleCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 				vms, err := d.client.List(sampleCtx)
 				if err == nil && soleRunningBuildVM(vms, h.vmConfig.Name) {
@@ -459,6 +464,7 @@ func (d *Driver) buildStats(ctx context.Context, h *taskHandle, interval time.Du
 						if err == nil {
 							select {
 							case ch <- sample:
+								sampled = true
 							case <-ctx.Done():
 								cancel()
 								return
@@ -470,6 +476,12 @@ func (d *Driver) buildStats(ctx context.Context, h *taskHandle, interval time.Du
 					}
 				}
 				cancel()
+				if sampled && unavailable {
+					d.logger.Info("build resource sampling recovered", "task_id", h.taskConfig.ID)
+				} else if !sampled && !unavailable {
+					d.logger.Warn("build resource sampling unavailable: VM inventory or process identity could not be verified", "task_id", h.taskConfig.ID)
+				}
+				unavailable = !sampled
 			}
 			select {
 			case <-ctx.Done():

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/hashicorp/nomad/client/lib/cpustats"
 	"github.com/hashicorp/nomad/plugins/drivers"
 )
 
@@ -82,6 +83,7 @@ func soleRunningBuildVM(vms []VMInfo, name string) bool {
 }
 
 type buildUsageCounter struct {
+	compute      cpustats.Compute
 	previous     map[processIdentity]float64
 	at           time.Time
 	root, helper processIdentity
@@ -112,6 +114,10 @@ func (c *buildUsageCounter) sample(ps []buildProcess, now time.Time) (*drivers.T
 	}
 	if validCPU {
 		cpu.Measured = []string{"Percent"}
+		if c.compute.TotalCompute > 0 && c.compute.NumCores > 0 {
+			cpu.TotalTicks = cpustats.New(c.compute).TicksConsumed(cpu.Percent)
+			cpu.Measured = append(cpu.Measured, "TotalTicks")
+		}
 	} else {
 		cpu.Percent = 0
 	}

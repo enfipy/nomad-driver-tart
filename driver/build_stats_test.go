@@ -3,6 +3,8 @@ package driver
 import (
 	"testing"
 	"time"
+
+	"github.com/hashicorp/nomad/client/lib/cpustats"
 )
 
 func statsFixture() []buildProcess {
@@ -20,7 +22,7 @@ func TestBuildUsageIncludesVMExcludesOtherWorkloads(t *testing.T) {
 	if err != nil || len(ps) != 3 {
 		t.Fatalf("selection: %v %v", ps, err)
 	}
-	var counter buildUsageCounter
+	counter := buildUsageCounter{compute: cpustats.Compute{TotalCompute: 20000, NumCores: 10}}
 	first, err := counter.sample(ps, time.Unix(10, 0))
 	if err != nil {
 		t.Fatal(err)
@@ -33,7 +35,7 @@ func TestBuildUsageIncludesVMExcludesOtherWorkloads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.ResourceUsage.CpuStats.Percent != 300 || second.ResourceUsage.MemoryStats.RSS != 207 {
+	if second.ResourceUsage.CpuStats.Percent != 300 || second.ResourceUsage.CpuStats.TotalTicks != 6000 || second.ResourceUsage.MemoryStats.RSS != 207 {
 		t.Fatalf("VM usage omitted or unrelated work counted: %+v", second.ResourceUsage)
 	}
 	if m := second.ResourceUsage.MemoryStats.Measured; len(m) != 1 || m[0] != "RSS" {
