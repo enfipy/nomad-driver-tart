@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -193,6 +194,26 @@ func TestAdmissionAndResourceValidation(t *testing.T) {
 	cfg.EncodeConcreteDriverConfig(TaskConfig{Command: "true"})
 	if _, _, e := d.StartTask(cfg); e == nil {
 		t.Fatal("concurrent admission accepted")
+	}
+}
+func TestBuildMemoryMaximum(t *testing.T) {
+	d, cfg := buildFixture(t)
+	memory := cfg.Resources.NomadResources.Memory.MemoryMB
+	for _, max := range []int64{-1, memory - 1, memory + 1} {
+		t.Run(fmt.Sprint(max), func(t *testing.T) {
+			request := cfg.Copy()
+			request.Resources.NomadResources.Memory.MemoryMaxMB = max
+			if err := d.config.Build.validateTask(request, TaskConfig{Command: "true"}); err == nil {
+				t.Fatalf("accepted memory maximum %d for fixed reservation %d", max, memory)
+			}
+		})
+	}
+	for _, max := range []int64{0, memory} {
+		request := cfg.Copy()
+		request.Resources.NomadResources.Memory.MemoryMaxMB = max
+		if err := d.config.Build.validateTask(request, TaskConfig{Command: "true"}); err != nil {
+			t.Fatalf("rejected fixed memory maximum %d: %v", max, err)
+		}
 	}
 }
 func TestCleanupFailureRemainsRecoverable(t *testing.T) {

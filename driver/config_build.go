@@ -89,7 +89,7 @@ func (c BuildConfig) validateTask(t *drivers.TaskConfig, tc TaskConfig) error {
 		return fmt.Errorf("guest command required")
 	}
 	r := t.Resources
-	if r == nil || r.NomadResources == nil || r.NomadResources.Cpu.CpuShares != c.CPU || r.NomadResources.Memory.MemoryMB != c.MemoryMB+c.OverheadMB || r.NomadResources.Memory.MemoryMaxMB > r.NomadResources.Memory.MemoryMB || len(r.NomadResources.Cpu.ReservedCores) != 0 {
+	if r == nil || r.NomadResources == nil || r.NomadResources.Cpu.CpuShares != c.CPU || r.NomadResources.Memory.MemoryMB != c.MemoryMB+c.OverheadMB || (r.NomadResources.Memory.MemoryMaxMB != 0 && r.NomadResources.Memory.MemoryMaxMB != r.NomadResources.Memory.MemoryMB) || len(r.NomadResources.Cpu.ReservedCores) != 0 {
 		return fmt.Errorf("task must reserve the complete CPU budget and guest RAM plus overhead; no cores or oversubscription")
 	}
 	return nil
