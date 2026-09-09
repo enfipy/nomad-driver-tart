@@ -86,6 +86,7 @@ func (d *Driver) buildFingerprint() *drivers.Fingerprint {
 		fp.Attributes["driver.tart.xcode"] = structs.NewStringAttribute(c.Xcode)
 		fp.Attributes["driver.tart.vcpus"] = structs.NewIntAttribute(int64(c.VCPUs), "")
 		fp.Attributes["driver.tart.memory_mb"] = structs.NewIntAttribute(c.MemoryMB, "MiB")
+		fp.Attributes["driver.tart.usage_scope"] = structs.NewStringAttribute("vm_processes")
 		fp.Attributes["driver.tart.qualification_only"] = structs.NewBoolAttribute(true)
 		fp.Attributes["driver.tart.busy"] = structs.NewBoolAttribute(busy)
 		return fp

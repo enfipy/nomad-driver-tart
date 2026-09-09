@@ -51,8 +51,14 @@ egress and software entitlements are operator responsibilities. Never bake signi
 Apple ID or reusable control credentials into an image.
 
 CPU reservations and guest dimensions are not hard host CPU-time/process-memory
-quotas. Reported build CPU/RSS measures the Tart process, not guest-used memory or
-Virtualization.framework helper memory. Live VM isolation, hardware accounting,
+quotas. Reported build CPU/RSS includes Tart, its descendants and the attributed
+Virtualization.framework VM helper. This requires the profile's dedicated UID and
+one active VM. The driver checks the owned VM inventory, kernel executable path,
+UID and process start identity. Missing, old or multiple helpers yield no fresh
+sample; other users' VMs and the Nomad client are excluded. CPU may exceed 100%
+(100% is one host core); RSS is summed host resident memory, not guest-used memory
+or a hard memory quota. Swap is not reported because the no-cgo Darwin backend's
+field is a page-in counter. Live VM isolation, hardware accounting,
 launchd/reboot and signed Xcode/Bevy image readiness remain qualification gates.
 Tests use fake Tart, real process/FIFO behavior and Nomad's executor; they do not
 establish hypervisor isolation. See [cloud #27](https://github.com/enfipy/cloud/issues/27).

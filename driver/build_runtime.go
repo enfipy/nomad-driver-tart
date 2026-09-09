@@ -19,7 +19,6 @@ import (
 	"github.com/hashicorp/nomad/drivers/shared/executor"
 	"github.com/hashicorp/nomad/plugins/drivers"
 	pstructs "github.com/hashicorp/nomad/plugins/shared/structs"
-	"github.com/shirou/gopsutil/v3/process"
 )
 
 // buildStore contains only the restrictive profile's durable ownership and
@@ -429,8 +428,8 @@ func (d *Driver) collectBuild(ctx context.Context, h *taskHandle) error {
 	return d.save(r)
 }
 
-// Executor stats remain the normal-mode API. Build samples explicitly report
-// the Tart process rather than claiming guest memory/Virtualization helper use.
+// Build samples include the attributed Virtualization helper and Tart's process
+// tree. Missing/ambiguous identity produces no fresh sample, never a false zero.
 func (d *Driver) buildStats(ctx context.Context, h *taskHandle, interval time.Duration) (<-chan *drivers.TaskResourceUsage, error) {
 	ch := make(chan *drivers.TaskResourceUsage)
 	if interval < time.Second {
@@ -438,36 +437,39 @@ func (d *Driver) buildStats(ctx context.Context, h *taskHandle, interval time.Du
 	}
 	go func() {
 		defer close(ch)
-		var last float64
-		var previous time.Time
+		var counter buildUsageCounter
 		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-h.doneCh:
+				return
+			default:
+			}
 			h.stateLock.RLock()
-			pid := h.pid
+			pid, started := h.pid, h.startedAt
 			h.stateLock.RUnlock()
 			if pid > 0 {
-				p, e := process.NewProcess(int32(pid))
-				if e == nil {
-					m, me := p.MemoryInfoWithContext(ctx)
-					t, te := p.TimesWithContext(ctx)
-					now := time.Now()
-					if me == nil && te == nil {
-						cpu := &drivers.CpuStats{}
-						if !previous.IsZero() {
-							cpu.Percent = 100 * (t.Total() - last) / now.Sub(previous).Seconds()
-							cpu.Measured = []string{"Percent"}
-						}
-						last = t.Total()
-						previous = now
-						sample := &drivers.TaskResourceUsage{Timestamp: now.UnixNano(), ResourceUsage: &drivers.ResourceUsage{CpuStats: cpu, MemoryStats: &drivers.MemoryStats{RSS: m.RSS, Swap: m.Swap, Measured: []string{"RSS", "Swap"}}}}
-						select {
-						case ch <- sample:
-						case <-ctx.Done():
-							return
-						case <-h.doneCh:
-							return
+				sampleCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+				vms, err := d.client.List(sampleCtx)
+				if err == nil && soleRunningBuildVM(vms, h.vmConfig.Name) {
+					ps, err := readBuildProcesses(sampleCtx, int32(pid), d.config.Build.TartPath, started)
+					if err == nil {
+						sample, err := counter.sample(ps, time.Now())
+						if err == nil {
+							select {
+							case ch <- sample:
+							case <-ctx.Done():
+								cancel()
+								return
+							case <-h.doneCh:
+								cancel()
+								return
+							}
 						}
 					}
 				}
+				cancel()
 			}
 			select {
 			case <-ctx.Done():
