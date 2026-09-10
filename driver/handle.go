@@ -123,7 +123,6 @@ func (h *taskHandle) TaskStatus() *drivers.TaskStatus {
 		ExitResult:      exitResult,
 		NetworkOverride: h.networkOverride.Copy(),
 		DriverAttributes: map[string]string{
-			// No custom attributes for now, but something like the task PID could be useful.
 			"pid": strconv.Itoa(h.pid),
 		},
 	}

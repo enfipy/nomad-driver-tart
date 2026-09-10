@@ -175,6 +175,9 @@ func (d *Driver) verifyTemporaryStaging() error {
 }
 
 func (d *Driver) validateTemporaryStaging() error {
+	if d.config.Build == nil {
+		return nil // Ordinary VM tasks do not have a private build store.
+	}
 	// Validate before invoking Tart too: its automatic GC must never follow a
 	// replaced staging directory into a foreign tree.
 	e := safeDir(filepath.Join(d.config.Build.StateDir, "vms", "tmp"))

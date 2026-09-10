@@ -183,19 +183,6 @@ nomad logs <ALLOCATION_ID>
 
 ## Development
 
-This driver is currently in development and provides basic functionality. Future enhancements may include:
-
-- Proper Tart VM lifecycle management
-- Resource isolation and management
-- Network configuration
-  - Bridged, host-only, and Softnet options
-- Volume mounts
-- Health checking
-
-The restrictive build profile keeps cleanup pending when Tart's best-effort GC
-leaves temporary pull/clone staging. It validates staging ancestry before invoking
-Tart and verifies the directory is empty before completing recovery.
-
 On Apple Silicon, opt in to the pinned Tart interruption tests with
 `TART_QUALIFICATION_BINARY=/absolute/path/to/tart go test -race ./driver -run TestRealTartInterruptedStaging`.
 They use temporary Tart homes, sparse Linux disks and a localhost registry; they

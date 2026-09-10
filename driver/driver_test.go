@@ -1,12 +1,36 @@
 package driver
 
 import (
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/plugins/drivers"
 )
+
+func TestOrdinarySetupFailurePreservesOtherVMs(t *testing.T) {
+	drv := NewTartDriver(hclog.NewNullLogger()).(*Driver)
+	drv.config.Enabled = true
+	defer drv.signalShutdown()
+	mock := &testClient{}
+	mock.setupErr = errors.New("setup interrupted")
+	mock.vms = []VMInfo{{Name: "unrelated", Status: VMStateRunning}}
+	drv.client = mock
+	cfg := &drivers.TaskConfig{ID: "failed-task", AllocID: "failed-allocation", Name: "vm", AllocDir: t.TempDir()}
+	if err := cfg.EncodeConcreteDriverConfig(TaskConfig{URL: "test-image", SSHUser: "guest", SSHPassword: "guest"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := drv.StartTask(cfg); !errors.Is(err, mock.setupErr) {
+		t.Fatalf("lost setup failure: %v", err)
+	}
+	if !mock.setupCalled || mock.stopCalled || mock.deleteCalled {
+		t.Fatal("startup did not preserve unrelated VMs")
+	}
+	if _, found := drv.tasks.Get(cfg.ID); found {
+		t.Fatal("failed startup published a running handle")
+	}
+}
 
 func TestStopTaskDeletesVM(t *testing.T) {
 	logger := hclog.NewNullLogger()

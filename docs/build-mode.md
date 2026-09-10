@@ -38,7 +38,8 @@ Nomad task logs.
 Ownership is persisted before clone. Short-lived CLI helpers retain the private
 store lock and are supervised through a parent-liveness pipe. The existing Nomad
 executor supervises the long-lived VM process. Build completion/cancellation joins
-both, verifies exact owned-VM deletion and retains failed cleanup for retry. A
+both, verifies exact owned-VM deletion and retains failed cleanup for retry. Tart
+staging ancestry is checked before GC and must be empty before recovery completes. A
 restart first reattaches/stops recorded build executors and cleans owned VMs, then
 reports interrupted builds as failed. Ordinary VM/prewarm recovery reattaches its
 executor without replaying setup or startup commands. Old handles without recorded
