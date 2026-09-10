@@ -119,6 +119,9 @@ func (d *Driver) configureBuild() (err error) {
 	return d.reconcileBuilds()
 }
 func (d *Driver) reconcileBuilds() error {
+	if e := d.validateTemporaryStaging(); e != nil {
+		return e
+	}
 	entries, e := os.ReadDir(filepath.Join(d.config.Build.StateDir, "records"))
 	if e != nil {
 		return e
@@ -147,7 +150,38 @@ func (d *Driver) reconcileBuilds() error {
 			}
 		}
 	}
+	return d.verifyTemporaryStaging()
+}
+
+// Tart runs best-effort GC before list/delete, but still exits successfully if
+// staging is locked or cannot be removed. Keep admission closed until its
+// private staging is actually empty; never implement a second deletion sweep.
+func (d *Driver) verifyTemporaryStaging() error {
+	if e := d.validateTemporaryStaging(); e != nil {
+		return e
+	}
+	path := filepath.Join(d.config.Build.StateDir, "vms", "tmp")
+	entries, e := os.ReadDir(path)
+	if os.IsNotExist(e) {
+		return nil
+	}
+	if e != nil {
+		return e
+	}
+	if len(entries) != 0 {
+		return fmt.Errorf("Tart temporary staging cleanup pending")
+	}
 	return nil
+}
+
+func (d *Driver) validateTemporaryStaging() error {
+	// Validate before invoking Tart too: its automatic GC must never follow a
+	// replaced staging directory into a foreign tree.
+	e := safeDir(filepath.Join(d.config.Build.StateDir, "vms", "tmp"))
+	if os.IsNotExist(e) {
+		return nil
+	}
+	return e
 }
 
 // Called under admission after recovery; another build may already own the slot.
@@ -174,6 +208,9 @@ func (d *Driver) pendingBuildCleanup() (bool, error) {
 // cleanupVM is shared by startup failure and build completion. Only the exact
 // owned destination is stopped/deleted; image caches and foreign VMs are untouched.
 func (d *Driver) cleanupVM(name string) error {
+	if e := d.validateTemporaryStaging(); e != nil {
+		return e
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	find := func() (VMState, bool, error) {
@@ -255,6 +292,9 @@ func (d *Driver) cleanupBuild(r *buildRecord) error {
 		}
 	}
 	if e := d.cleanupVM(r.VM); e != nil {
+		return e
+	}
+	if e := d.verifyTemporaryStaging(); e != nil {
 		return e
 	}
 	if e := cleanupBuildArtifacts(*r); e != nil {

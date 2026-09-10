@@ -192,6 +192,15 @@ This driver is currently in development and provides basic functionality. Future
 - Volume mounts
 - Health checking
 
+The restrictive build profile keeps cleanup pending when Tart's best-effort GC
+leaves temporary pull/clone staging. It validates staging ancestry before invoking
+Tart and verifies the directory is empty before completing recovery.
+
+On Apple Silicon, opt in to the pinned Tart interruption tests with
+`TART_QUALIFICATION_BINARY=/absolute/path/to/tart go test -race ./driver -run TestRealTartInterruptedStaging`.
+They use temporary Tart homes, sparse Linux disks and a localhost registry; they
+never boot a VM or use the installed image cache.
+
 ### Continuous Integration
 
 A GitHub Actions workflow automatically formats, vets, and builds the driver for darwin/arm64 on every pull request and push to `main`. Releases are handled by a separate workflow that runs [GoReleaser](https://goreleaser.com/) whenever a tag starting with `v` is pushed. The release workflow can also be manually triggered to produce a snapshot from any commit.
