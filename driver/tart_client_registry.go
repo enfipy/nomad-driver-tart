@@ -14,6 +14,9 @@ import (
 // auth credentials are configured. The resulting environment is suitable for
 // reuse across subsequent tart invocations (clone, pull, etc.).
 func (c *tartCLI) PrepareRegistryEnv(ctx context.Context, config VMConfig) ([]string, error) {
+	if config.Build != nil {
+		return config.Build.hostEnv(), nil
+	}
 	env := os.Environ()
 	if config.Nomad != nil {
 		env = append(env, config.Nomad.EnvList()...)
@@ -53,13 +56,20 @@ func (c *tartCLI) BuildPullArgs(config VMConfig) []string {
 // VM based on the provided configuration. This centralizes tart-specific flag
 // construction away from the driver.
 func (c *tartCLI) BuildStartArgs(config VMConfig) ([]string, error) {
-	vmName := vmName(config.Nomad.AllocID)
+	vmName := config.name()
 
 	args := []string{"run", vmName}
 	if !config.Driver.ShowUI {
 		args = append(args, "--no-graphics")
 	}
 
+	if config.Build != nil {
+		args = append(args, "--no-clipboard", "--no-audio", "--net-softnet", "--net-softnet-block", strings.Join(config.Build.Block, ","))
+		if len(config.Build.Allow) > 0 {
+			args = append(args, "--net-softnet-allow", strings.Join(config.Build.Allow, ","))
+		}
+		return args, nil
+	}
 	// Mount the Nomad task's secrets directory read-only if present
 	if config.Nomad != nil {
 		td := config.Nomad.TaskDir()

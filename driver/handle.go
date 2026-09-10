@@ -2,7 +2,6 @@ package driver
 
 import (
 	"context"
-	"fmt"
 	"strconv"
 	"sync"
 	"time"
@@ -50,6 +49,14 @@ func (ts *taskStore) Delete(id string) {
 
 // taskHandle is a handle to a running task
 type taskHandle struct {
+	vmConfig    VMConfig
+	build       *buildRecord
+	launch      func() error
+	finish      func(*drivers.ExitResult) *drivers.ExitResult
+	startupDone chan struct{}
+	// shutdown cancels/joins a build without racing its asynchronous launch.
+	shutdown context.CancelFunc
+
 	// stateLock syncs access to all fields below
 	stateLock sync.RWMutex
 
@@ -116,11 +123,16 @@ func (h *taskHandle) TaskStatus() *drivers.TaskStatus {
 		ExitResult:      exitResult,
 		NetworkOverride: h.networkOverride.Copy(),
 		DriverAttributes: map[string]string{
-			// No custom attributes for now, but something like the task PID could be useful.
 			"pid": strconv.Itoa(h.pid),
 		},
 	}
 
+	if h.build != nil {
+		status.DriverAttributes["phase"] = h.build.Phase
+		status.DriverAttributes["vm"] = h.build.VM
+		status.DriverAttributes["image"] = h.build.Image
+		status.DriverAttributes["artifact_sha256"] = h.build.ArtifactSHA256
+	}
 	return status
 }
 
@@ -131,55 +143,53 @@ func (h *taskHandle) IsRunning() bool {
 	return h.state == drivers.TaskStateRunning
 }
 
-// run waits on the executor and updates the task state when the process exits.
+// run is the shared completion path for persistent VMs, prewarming and builds.
 func (h *taskHandle) run() {
 	defer close(h.doneCh)
-	// Keep the startup command alive for the lifetime of the task and only
-	// cancel it once the backing VM task exits.
-	if h.startupCancel != nil {
-		defer h.startupCancel()
+	var result = &drivers.ExitResult{}
+	var err error
+	if h.launch != nil {
+		err = h.launch()
 	}
-
-	h.stateLock.Lock()
-	if h.exitResult == nil {
-		h.exitResult = &drivers.ExitResult{}
+	if err == nil {
+		ps, e := h.exec.Wait(context.Background())
+		err = e
+		if ps != nil {
+			result.ExitCode = ps.ExitCode
+			result.Signal = ps.Signal
+		}
 	}
-	h.stateLock.Unlock()
-
-	ps, err := h.exec.Wait(context.Background())
-
-	h.stateLock.Lock()
-	defer h.stateLock.Unlock()
-
 	if err != nil {
-		h.exitResult.Err = err
-		h.state = drivers.TaskStateUnknown
-		h.completedAt = time.Now()
-		return
+		result.Err = err
+		result.ExitCode = -1
 	}
-
+	if h.startupCancel != nil {
+		h.startupCancel()
+	}
+	if h.startupDone != nil {
+		<-h.startupDone
+	}
+	if h.finish != nil {
+		result = h.finish(result)
+	}
+	h.stateLock.Lock()
+	h.exitResult = result
 	h.state = drivers.TaskStateExited
-	h.exitResult.ExitCode = ps.ExitCode
-	h.exitResult.Signal = ps.Signal
-	h.completedAt = ps.Time
+	h.completedAt = time.Now()
+	h.stateLock.Unlock()
 }
 
 func (d *Driver) handleWait(ctx context.Context, handle *taskHandle, ch chan *drivers.ExitResult) {
 	defer close(ch)
 
-	var result *drivers.ExitResult
-	ps, err := handle.exec.Wait(ctx)
-	if err != nil {
-		result = &drivers.ExitResult{
-			Err: fmt.Errorf("executor: error waiting on process: %w", err),
-		}
-	} else {
-		result = &drivers.ExitResult{
-			ExitCode: ps.ExitCode,
-			Signal:   ps.Signal,
-		}
+	select {
+	case <-ctx.Done():
+		return
+	case <-d.ctx.Done():
+		return
+	case <-handle.doneCh:
 	}
-
+	result := handle.TaskStatus().ExitResult
 	select {
 	case <-ctx.Done():
 	case <-d.ctx.Done():

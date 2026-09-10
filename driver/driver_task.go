@@ -2,18 +2,28 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
-	"github.com/hashicorp/go-hclog"
 	plugin "github.com/hashicorp/go-plugin"
+	"github.com/hashicorp/nomad/client/lib/cpustats"
 	"github.com/hashicorp/nomad/drivers/shared/executor"
 	"github.com/hashicorp/nomad/plugins/drivers"
+	pstructs "github.com/hashicorp/nomad/plugins/shared/structs"
 )
 
 func (d *Driver) createExecutor(cfg *drivers.TaskConfig, handle *drivers.TaskHandle) (executor.Executor, *plugin.Client, error) {
+	if d.executorFactory != nil {
+		return d.executorFactory(cfg, handle)
+	}
+	if d.nomadConfig == nil || d.nomadConfig.Topology == nil {
+		return nil, nil, fmt.Errorf("Nomad executor topology unavailable")
+	}
 	pluginLogFile := filepath.Join(cfg.TaskDir().Dir, "executor.out")
 	execConfig := &executor.ExecutorConfig{
 		LogFile:  pluginLogFile,
@@ -74,8 +84,13 @@ func (d *Driver) startPullOnlyTask(cfg *drivers.TaskConfig, vmConfig VMConfig, h
 		return nil, nil, err
 	}
 
+	path, err := d.tartPath()
+	if err != nil {
+		pluginClient.Kill()
+		return nil, nil, err
+	}
 	execCmd := &executor.ExecCommand{
-		Cmd:              "tart",
+		Cmd:              path,
 		Args:             d.client.BuildPullArgs(vmConfig),
 		Env:              tartEnvList(cfg),
 		User:             cfg.User,
@@ -92,9 +107,11 @@ func (d *Driver) startPullOnlyTask(cfg *drivers.TaskConfig, vmConfig VMConfig, h
 	}
 
 	state := driverState{
-		TaskConfig: cfg,
-		StartedAt:  time.Now(),
-		PullOnly:   true,
+		TaskConfig:     cfg,
+		StartedAt:      time.Now(),
+		PullOnly:       true,
+		Pid:            ps.Pid,
+		ReattachConfig: pstructs.ReattachConfigFromGoPlugin(pluginClient.ReattachConfig()),
 	}
 	handle.State = drivers.TaskStateRunning
 	if err := handle.SetDriverState(&state); err != nil {
@@ -121,152 +138,243 @@ func (d *Driver) startPullOnlyTask(cfg *drivers.TaskConfig, vmConfig VMConfig, h
 	return handle, nil, nil
 }
 
-// StartTask returns a task handle and a driver network if necessary.
+// StartTask validates policy before any registry, mount, VM or executor operation.
 func (d *Driver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *drivers.DriverNetwork, error) {
+	d.admission.Lock()
+	defer d.admission.Unlock()
 	if _, ok := d.tasks.Get(cfg.ID); ok {
-		return nil, nil, fmt.Errorf("task with ID %q already started", cfg.ID)
+		return nil, nil, fmt.Errorf("task already started")
 	}
-
-	var taskConfig TaskConfig
-	if err := cfg.DecodeDriverConfig(&taskConfig); err != nil {
-		return nil, nil, fmt.Errorf("failed to decode driver config: %w", err)
+	var tc TaskConfig
+	if err := cfg.DecodeDriverConfig(&tc); err != nil {
+		return nil, nil, err
 	}
-
+	if err := d.validateTask(cfg, tc); err != nil {
+		return nil, nil, err
+	}
 	handle := drivers.NewTaskHandle(taskHandleVersion)
 	handle.Config = cfg
-
-	vmConfig := VMConfig{
-		Driver: taskConfig,
-		Nomad:  cfg,
+	vm := VMConfig{Driver: tc, Nomad: cfg, Name: vmName(cfg.AllocID + "-" + taskKey(cfg.ID)[:12]), Build: d.config.Build}
+	if tc.PullOnly {
+		return d.startPullOnlyTask(cfg, vm, handle)
 	}
-	vmConfig.Driver.Directories = resolveDirectoryMounts(cfg, vmConfig.Driver.Directories)
-	d.logger.Info("starting tart task", "task_cfg", hclog.Fmt("%+v", vmConfig.Driver))
-	if exposures := nomadPortExposures(cfg); len(exposures) > 0 {
-		d.logger.Debug("found Nomad allocated port mappings for Tart networking", "ports", hclog.Fmt("%+v", exposures))
+	h := &taskHandle{taskConfig: cfg, vmConfig: vm, state: drivers.TaskStateRunning, startedAt: time.Now(), logger: d.logger, doneCh: make(chan struct{})}
+	if vm.Build != nil {
+		if d.build == nil || d.build.busy {
+			return nil, nil, fmt.Errorf("build store unavailable, busy or cleanup pending")
+		}
+		if _, e := os.Lstat(d.recordPath(cfg.ID)); !os.IsNotExist(e) {
+			return nil, nil, fmt.Errorf("existing task must be recovered")
+		}
+		r := newRecord(cfg.ID, cfg.AllocID, vm.Build.Image)
+		if e := d.save(r); e != nil {
+			return nil, nil, e
+		}
+		h.build = &r
+		vm.Name = r.VM
+		vm.Driver.URL = r.Image
+		vm.Driver.GuestAgent = true
+		h.vmConfig = vm
+		ctx, cancel := context.WithTimeout(d.ctx, time.Duration(vm.Build.TimeoutSeconds)*time.Second)
+		h.startupCancel = cancel
+		h.shutdown = cancel
+		diskDone := make(chan struct{})
+		h.launch = func() error {
+			go func() {
+				defer close(diskDone)
+				if e := monitorDisk(ctx, time.Second, uint64(vm.Build.MinFreeDiskMB)*1024*1024, func() (uint64, error) { return freeDisk(vm.Build.StateDir) }); e != nil {
+					h.failBuild(e)
+					cancel()
+				}
+			}()
+			return d.launchTask(ctx, h, handle)
+		}
+		h.finish = func(result *drivers.ExitResult) *drivers.ExitResult {
+			<-diskDone
+			return d.finishBuild(h, result)
+		}
+		if e := handle.SetDriverState(&driverState{TaskConfig: cfg, StartedAt: h.startedAt, VMName: vm.Name, Build: true}); e != nil {
+			return nil, nil, e
+		}
+		handle.State = drivers.TaskStateRunning
+		d.build.busy = true
+		d.tasks.Set(cfg.ID, h)
+		go h.run()
+		return handle, nil, nil
 	}
-
-	if taskConfig.PullOnly {
-		return d.startPullOnlyTask(cfg, vmConfig, handle)
+	// Keep the existing synchronous network override for ordinary VM tasks.
+	if e := d.launchTask(d.ctx, h, handle); e != nil {
+		return nil, nil, e
 	}
-
-	if taskConfig.SSHUser == "" || taskConfig.SSHPassword == "" {
-		return nil, nil, fmt.Errorf("ssh_user and ssh_password are required unless pull_only = true")
-	}
-
-	needsDownload, err := d.client.NeedsImageDownload(d.ctx, vmConfig)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to check image availability: %w", err)
-	}
-	if needsDownload {
-		d.logger.Info("VM image not found locally, downloading", "url", taskConfig.URL)
-		d.emitTaskEvent(cfg, "Downloading VM image", map[string]string{
-			"url": taskConfig.URL,
-		})
-	}
-
-	if _, err := d.client.Setup(d.ctx, vmConfig); err != nil {
-		return nil, nil, fmt.Errorf("failed to setup VM: %w", err)
-	}
-
-	if needsDownload {
-		d.emitTaskEvent(cfg, "VM image download complete", map[string]string{
-			"url": taskConfig.URL,
-		})
-	}
-
-	execImpl, pluginClient, err := d.createExecutor(cfg, handle)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	args, err := d.client.BuildStartArgs(vmConfig)
-	if err != nil {
-		pluginClient.Kill()
-		return nil, nil, err
-	}
-
-	execCmd := &executor.ExecCommand{
-		Cmd:              "tart",
-		Args:             args,
-		Env:              tartEnvList(cfg),
-		User:             cfg.User,
-		TaskDir:          cfg.TaskDir().Dir,
-		StdoutPath:       cfg.StdoutPath,
-		StderrPath:       cfg.StderrPath,
-		NetworkIsolation: cfg.NetworkIsolation,
-	}
-
-	ps, err := execImpl.Launch(execCmd)
-	if err != nil {
-		pluginClient.Kill()
-		return nil, nil, fmt.Errorf("failed to launch VM: %w", err)
-	}
-
-	// Store the driver state on the handle
-	state := driverState{
-		TaskConfig: cfg,
-		StartedAt:  time.Now(),
-	}
-
-	handle.State = drivers.TaskStateRunning
-
-	// Encode the driver state
-	if err := handle.SetDriverState(&state); err != nil {
-		execImpl.Shutdown("", 0)
-		pluginClient.Kill()
-		return nil, nil, fmt.Errorf("failed to set driver state: %w", err)
-	}
-
-	networkOverride, err := d.resolveDriverNetwork(vmConfig)
-	if err != nil {
-		d.logger.Warn("failed to determine driver network override; continuing without one", "task_id", cfg.ID, "error", err)
-	}
-
-	h := &taskHandle{
-		exec:            execImpl,
-		pluginClient:    pluginClient,
-		pid:             ps.Pid,
-		taskConfig:      cfg,
-		state:           drivers.TaskStateRunning,
-		startedAt:       time.Now(),
-		logger:          d.logger,
-		doneCh:          make(chan struct{}),
-		networkOverride: networkOverride.Copy(),
-	}
-
-	stdoutFile, err := openTaskLog(cfg.StdoutPath)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to open stdout file: %w", err)
-	}
-
-	stderrFile, err := openTaskLog(cfg.StderrPath)
-	if err != nil {
-		stdoutFile.Close()
-		return nil, nil, fmt.Errorf("failed to open stderr file: %w", err)
-	}
-
 	d.tasks.Set(cfg.ID, h)
-
-	// If a startup command is configured, run it once SSH is available.
-	if taskConfig.Command != "" || len(taskConfig.Args) > 0 {
-		startupCtx, startupCancel := context.WithCancel(d.ctx)
-		h.startupCancel = startupCancel
-		go func() {
-			defer startupCancel()
-			defer stdoutFile.Close()
-			defer stderrFile.Close()
-			d.executeStartupCommand(startupCtx, cfg.ID, cfg.Name, cfg.AllocID,
-				vmConfig, stdoutFile, stderrFile)
-		}()
-	} else {
-		stdoutFile.Close()
-		stderrFile.Close()
-	}
-
 	go h.run()
+	return handle, h.networkOverride.Copy(), nil
+}
 
-	// Return a driver handle
-	return handle, networkOverride.Copy(), nil
+// launchTask is shared by SSH VMs and disposable guest-agent builds.
+func (d *Driver) launchTask(ctx context.Context, h *taskHandle, handle *drivers.TaskHandle) (err error) {
+	cfg, vm := h.taskConfig, h.vmConfig
+	if vm.Build == nil {
+		vm.Driver.Directories = resolveDirectoryMounts(cfg, vm.Driver.Directories)
+		h.vmConfig = vm
+	}
+	needsDownload, e := d.client.NeedsImageDownload(ctx, vm)
+	if e != nil {
+		return e
+	}
+	if vm.Build != nil {
+		available, e := freeDisk(vm.Build.StateDir)
+		if e != nil {
+			return e
+		}
+		if e = vm.Build.checkDisk(available, needsDownload); e != nil {
+			return e
+		}
+	}
+	if needsDownload {
+		d.emitTaskEvent(cfg, "Downloading VM image", map[string]string{"url": vm.Driver.URL})
+	}
+	// Even partial Setup may have created the destination. Build finalization
+	// journals failed cleanup; ordinary startup also attempts owned cleanup.
+	defer func() {
+		if err != nil && h.build == nil {
+			if cleanupErr := d.cleanupVM(vm.Name); cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("startup cleanup failed: %w", cleanupErr))
+			}
+		}
+	}()
+	if _, e = d.client.Setup(ctx, vm); e != nil {
+		return e
+	}
+	if needsDownload {
+		d.emitTaskEvent(cfg, "VM image download complete", map[string]string{"url": vm.Driver.URL})
+	}
+	execImpl, pluginClient, e := d.createExecutor(cfg, handle)
+	if e != nil {
+		return e
+	}
+	defer func() {
+		if err != nil {
+			_ = execImpl.Shutdown("", 0)
+			if pluginClient != nil {
+				pluginClient.Kill()
+			}
+		}
+	}()
+	state := driverState{TaskConfig: cfg, StartedAt: h.startedAt, VMName: vm.Name, Build: vm.Build != nil}
+	if pluginClient != nil {
+		state.ReattachConfig = pstructs.ReattachConfigFromGoPlugin(pluginClient.ReattachConfig())
+	}
+	if h.build != nil {
+		h.stateLock.Lock()
+		h.build.Reattach = state.ReattachConfig
+		r := *h.build
+		h.stateLock.Unlock()
+		if e = d.save(r); e != nil {
+			return e
+		}
+	}
+	args, e := d.client.BuildStartArgs(vm)
+	if e != nil {
+		return e
+	}
+	path, e := d.tartPath()
+	if e != nil {
+		return e
+	}
+	ec := &executor.ExecCommand{Cmd: path, Args: args, Env: tartEnvList(cfg), User: cfg.User, TaskDir: cfg.TaskDir().Dir, StdoutPath: cfg.StdoutPath, StderrPath: cfg.StderrPath, NetworkIsolation: cfg.NetworkIsolation}
+	if vm.Build != nil {
+		ec.Env = vm.Build.hostEnv()
+		ec.TaskDir = vm.Build.StateDir
+		// Keep VM startup diagnostics in Nomad's rotating task logs alongside
+		// guest output; an early Tart exit otherwise loses its actual cause.
+		ec.NetworkIsolation = nil
+	}
+	if e = ctx.Err(); e != nil {
+		return e
+	}
+	ps, e := execImpl.Launch(ec)
+	if e != nil {
+		return e
+	}
+	h.stateLock.Lock()
+	h.exec = execImpl
+	h.pluginClient = pluginClient
+	h.pid = ps.Pid
+	h.stateLock.Unlock()
+	state.Pid = ps.Pid
+	// Build handles have already been returned to Nomad. Their executor identity
+	// is journaled above; never mutate the returned handle asynchronously.
+	if vm.Build == nil {
+		handle.State = drivers.TaskStateRunning
+		if e = handle.SetDriverState(&state); e != nil {
+			return e
+		}
+	}
+	if vm.Build != nil {
+		h.startupDone = make(chan struct{})
+		go func() {
+			defer close(h.startupDone)
+			d.executeBuild(ctx, h)
+			_ = execImpl.Shutdown("SIGINT", 10*time.Second)
+		}()
+		return nil
+	}
+	network, e := d.resolveDriverNetwork(vm)
+	if e == nil {
+		h.networkOverride = network.Copy()
+	}
+	if vm.Driver.Command != "" || len(vm.Driver.Args) > 0 {
+		startupCtx, cancel := context.WithCancel(ctx)
+		h.startupCancel = cancel
+		out, e := openTaskLog(cfg.StdoutPath)
+		if e != nil {
+			return e
+		}
+		stderr, e := openTaskLog(cfg.StderrPath)
+		if e != nil {
+			out.Close()
+			return e
+		}
+		go func() {
+			defer cancel()
+			defer out.Close()
+			defer stderr.Close()
+			if vm.Driver.GuestAgent {
+				if e := d.waitForGuestAgent(startupCtx, vm); e != nil {
+					return
+				}
+			}
+			d.executeStartupCommand(startupCtx, cfg.ID, cfg.Name, cfg.AllocID, vm, out, stderr)
+		}()
+	}
+	return nil
+}
+
+func (d *Driver) tartPath() (string, error) {
+	if d.config.Build != nil {
+		return d.config.Build.TartPath, nil
+	}
+	return exec.LookPath("tart")
+}
+
+func (d *Driver) validateTask(cfg *drivers.TaskConfig, tc TaskConfig) error {
+	if !d.config.Enabled {
+		return fmt.Errorf("driver is disabled")
+	}
+	if d.config.Build != nil {
+		return d.config.Build.validateTask(cfg, tc)
+	}
+	if tc.Source || tc.Artifacts {
+		return fmt.Errorf("source/artifacts require an operator build profile")
+	}
+	if tc.URL == "" {
+		return fmt.Errorf("url is required")
+	}
+	if !tc.PullOnly && !tc.GuestAgent && (tc.SSHUser == "" || tc.SSHPassword == "") {
+		return fmt.Errorf("ssh_user and ssh_password are required for SSH VMs")
+	}
+	return nil
 }
 
 // RecoverTask recreates the in-memory state of a task from a TaskHandle.
@@ -284,13 +392,80 @@ func (d *Driver) RecoverTask(h *drivers.TaskHandle) error {
 		return fmt.Errorf("failed to decode task state from handle: %w", err)
 	}
 
-	// Start the task with the previous configuration.
-	d.logger.Info("recovered tart task", "task_id", h.Config.ID)
-	_, _, err := d.StartTask(taskState.TaskConfig)
-	if err != nil {
-		return fmt.Errorf("failed to start task: %w", err)
+	if h.Config == nil || taskState.TaskConfig == nil || h.Config.ID != taskState.TaskConfig.ID || h.Config.AllocID != taskState.TaskConfig.AllocID {
+		return fmt.Errorf("recovery identity mismatch")
 	}
-
+	if _, ok := d.tasks.Get(h.Config.ID); ok {
+		return nil
+	}
+	if d.config.Build != nil || taskState.Build {
+		d.admission.Lock()
+		defer d.admission.Unlock()
+		if d.config.Build == nil || !taskState.Build {
+			return fmt.Errorf("recovery profile mismatch")
+		}
+		r, e := readRecord(d.recordPath(h.Config.ID))
+		if e != nil {
+			return e
+		}
+		if r.AllocID != h.Config.AllocID || h.Config.TaskDir().LocalDir != taskState.TaskConfig.TaskDir().LocalDir || (r.ArtifactDir != "" && r.ArtifactDir != h.Config.TaskDir().LocalDir) {
+			return fmt.Errorf("recovery artifact identity mismatch")
+		}
+		// Older records did not journal the export directory. The matching Nomad
+		// handle supplies it before any recovered terminal result is published.
+		r.ArtifactDir = h.Config.TaskDir().LocalDir
+		r.CleanupPending = true
+		if e := d.cleanupBuild(&r); e != nil {
+			r.Phase = "cleanup_pending"
+			r.Failure = strings.TrimPrefix(r.Failure+"; recovered artifact cleanup: "+e.Error(), "; ")
+			d.build.busy = true
+			if persist := d.save(r); persist != nil {
+				return fmt.Errorf("cleanup failed: %v; persisting cleanup: %w", e, persist)
+			}
+			return fmt.Errorf("recovered artifact cleanup: %w", e)
+		}
+		if r.Phase == "cleanup_pending" {
+			r.Phase = "complete"
+			r.Finished = time.Now()
+		}
+		if e := d.save(r); e != nil {
+			return e
+		}
+		if e := publishBuildResult(h.Config, r); e != nil {
+			return fmt.Errorf("publishing recovered build result: %w", e)
+		}
+		d.build.busy, e = d.pendingBuildCleanup()
+		if e != nil {
+			return e
+		}
+		th := &taskHandle{taskConfig: h.Config, build: &r, state: drivers.TaskStateExited, startedAt: r.Started, completedAt: r.Finished, exitResult: buildResult(r), doneCh: make(chan struct{})}
+		close(th.doneCh)
+		d.tasks.Set(h.Config.ID, th)
+		return nil
+	}
+	if taskState.ReattachConfig == nil {
+		return fmt.Errorf("old handle lacks executor identity; refusing to replay task")
+	}
+	rc, e := pstructs.ReattachConfigToGoPlugin(taskState.ReattachConfig)
+	if e != nil {
+		return e
+	}
+	compute := cpustats.Compute{}
+	if d.nomadConfig != nil && d.nomadConfig.Topology != nil {
+		compute = d.nomadConfig.Topology.Compute()
+	}
+	ex, pc, e := executor.ReattachToExecutor(rc, d.logger, compute)
+	if e != nil {
+		return e
+	}
+	var tc TaskConfig
+	if e = h.Config.DecodeDriverConfig(&tc); e != nil {
+		pc.Kill()
+		return e
+	}
+	th := &taskHandle{taskConfig: h.Config, vmConfig: VMConfig{Driver: tc, Nomad: h.Config, Name: taskState.VMName}, exec: ex, pluginClient: pc, pid: taskState.Pid, state: drivers.TaskStateRunning, startedAt: taskState.StartedAt, doneCh: make(chan struct{}), logger: d.logger, pullOnly: taskState.PullOnly}
+	d.tasks.Set(h.Config.ID, th)
+	go th.run()
 	return nil
 }
 
@@ -313,11 +488,28 @@ func (d *Driver) StopTask(taskID string, timeout time.Duration, signal string) e
 		return drivers.ErrTaskNotFound
 	}
 
+	if handle.build != nil {
+		if handle.shutdown != nil {
+			handle.shutdown()
+		}
+		select {
+		case <-handle.doneCh:
+		case <-time.After(90 * time.Second):
+			return fmt.Errorf("task shutdown timed out")
+		}
+		handle.stateLock.RLock()
+		pending := handle.build != nil && handle.build.CleanupPending
+		handle.stateLock.RUnlock()
+		if pending {
+			return fmt.Errorf("VM cleanup pending")
+		}
+		return nil
+	}
 	var allocVMName string
 	if handle.taskConfig != nil && !handle.pullOnly {
-		allocVMName = vmName(handle.taskConfig.AllocID)
+		allocVMName = handle.vmName()
 		if err := d.client.Stop(d.ctx, allocVMName, timeout); err != nil {
-			d.logger.Warn("failed to stop VM via virtualizer", "task_id", taskID, "error", err)
+			return fmt.Errorf("VM stop failed: %w", err)
 		}
 	} else if handle.taskConfig == nil {
 		d.logger.Warn("task config missing while stopping task", "task_id", taskID)
@@ -340,7 +532,7 @@ func (d *Driver) StopTask(taskID string, timeout time.Duration, signal string) e
 
 	if allocVMName != "" {
 		if err := d.client.Delete(d.ctx, allocVMName); err != nil {
-			d.logger.Warn("failed to delete VM via virtualizer", "task_id", taskID, "error", err)
+			return fmt.Errorf("VM deletion failed: %w", err)
 		}
 	}
 
@@ -355,10 +547,40 @@ func (d *Driver) DestroyTask(taskID string, force bool) error {
 		return drivers.ErrTaskNotFound
 	}
 
+	if handle.shutdown != nil && handle.IsRunning() && force {
+		if e := d.StopTask(taskID, 10*time.Second, ""); e != nil {
+			return e
+		}
+	}
 	if handle.IsRunning() && !force {
 		return fmt.Errorf("cannot destroy running task")
 	}
 
+	if handle.build != nil {
+		handle.stateLock.RLock()
+		r := *handle.build
+		handle.stateLock.RUnlock()
+		if r.CleanupPending {
+			if e := d.cleanupBuild(&r); e != nil {
+				return e
+			}
+			if e := d.save(r); e != nil {
+				return e
+			}
+			d.admission.Lock()
+			pending, scanErr := d.pendingBuildCleanup()
+			d.build.busy = pending || scanErr != nil
+			d.admission.Unlock()
+			if scanErr != nil {
+				return scanErr
+			}
+		}
+		if e := os.Remove(d.recordPath(taskID)); e != nil && !errors.Is(e, os.ErrNotExist) {
+			return e
+		}
+		d.tasks.Delete(taskID)
+		return nil
+	}
 	if handle.pluginClient != nil && !handle.pluginClient.Exited() {
 		if handle.exec != nil {
 			if err := handle.exec.Shutdown("", 0); err != nil {
@@ -371,9 +593,9 @@ func (d *Driver) DestroyTask(taskID string, force bool) error {
 	}
 
 	if handle.taskConfig != nil && !handle.pullOnly {
-		allocVMName := vmName(handle.taskConfig.AllocID)
+		allocVMName := handle.vmName()
 		if err := d.client.Delete(d.ctx, allocVMName); err != nil {
-			d.logger.Warn("failed to delete VM via virtualizer", "task_id", taskID, "error", err)
+			return fmt.Errorf("VM deletion failed: %w", err)
 		}
 	} else if handle.taskConfig == nil {
 		d.logger.Warn("task config missing while destroying task", "task_id", taskID)
@@ -400,6 +622,9 @@ func (d *Driver) TaskStats(ctx context.Context, taskID string, interval time.Dur
 	if !ok {
 		return nil, drivers.ErrTaskNotFound
 	}
+	if h.build != nil {
+		return d.buildStats(ctx, h, interval)
+	}
 	return h.exec.Stats(ctx, interval)
 }
 
@@ -410,6 +635,9 @@ func (d *Driver) TaskEvents(ctx context.Context) (<-chan *drivers.TaskEvent, err
 
 // SignalTask forwards a signal to a task.
 func (d *Driver) SignalTask(taskID string, signal string) error {
+	if d.config.Build != nil {
+		return fmt.Errorf("signals disabled in build profile")
+	}
 	_, ok := d.tasks.Get(taskID)
 	if !ok {
 		return drivers.ErrTaskNotFound
@@ -445,6 +673,9 @@ func (d *Driver) ExecTaskStreaming(ctx context.Context, taskID string, opts *dri
 		return nil, drivers.ErrTaskNotFound
 	}
 
+	if d.config.Build != nil {
+		return nil, fmt.Errorf("interactive exec disabled in build profile")
+	}
 	var taskCfg TaskConfig
 	if err := handle.taskConfig.DecodeDriverConfig(&taskCfg); err != nil {
 		return nil, fmt.Errorf("failed to decode driver config: %w", err)
@@ -462,6 +693,7 @@ func (d *Driver) ExecTaskStreaming(ctx context.Context, taskID string, opts *dri
 	vmConfig := VMConfig{
 		Driver: taskCfg,
 		Nomad:  handle.taskConfig,
+		Name:   handle.vmName(),
 	}
 
 	exitCode, err := d.client.Exec(ctx, vmConfig, execOptions)
@@ -470,4 +702,11 @@ func (d *Driver) ExecTaskStreaming(ctx context.Context, taskID string, opts *dri
 	}
 
 	return &drivers.ExitResult{ExitCode: exitCode}, nil
+}
+
+func (h *taskHandle) vmName() string {
+	if h.vmConfig.Name != "" {
+		return h.vmConfig.Name
+	}
+	return vmName(h.taskConfig.AllocID)
 }

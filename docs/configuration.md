@@ -1,5 +1,12 @@
 # Nomad Tart Driver Configuration
 
+For the optional restrictive client profile, see [build mode](build-mode.md).
+The existing task options below remain available on ordinary clients. `url` is
+required there; build clients take the pinned image exclusively from their profile.
+`guest_agent = true` selects Tart RPC instead of SSH for ordinary startup/exec
+commands (without TTY support). `source` and `artifacts` require the build profile.
+
+
 This document explains all configuration parameters for the Tart VM Nomad driver, what they do, and how to use or access the resulting features from inside the VM when applicable.
 
 

@@ -17,7 +17,7 @@ import (
 func (d *Driver) waitForIPAddress(ctx context.Context, vmConfig VMConfig) (string, error) {
 	backoff := 1 * time.Second
 	maxBackoff := 10 * time.Second
-	name := vmName(vmConfig.Nomad.AllocID)
+	name := vmConfig.name()
 
 	for {
 		ip, err := d.client.IPAddress(ctx, name, vmConfig.Driver.Network)
@@ -31,7 +31,11 @@ func (d *Driver) waitForIPAddress(ctx context.Context, vmConfig VMConfig) (strin
 		default:
 		}
 
-		time.Sleep(backoff)
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(backoff):
+		}
 		if backoff < maxBackoff {
 			backoff *= 2
 			if backoff > maxBackoff {
@@ -137,7 +141,11 @@ func (d *Driver) executeStartupCommand(
 
 		if errors.Is(err, errVMIPUnavailable) || errors.Is(err, errSSHDialFailed) || errors.Is(err, errSSHSessionFailed) {
 			d.logger.Debug("Startup command SSH not ready; retrying", "command", commandStr, "error", err)
-			time.Sleep(backoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
 			if backoff < maxBackoff {
 				backoff *= 2
 				if backoff > maxBackoff {

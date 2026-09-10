@@ -89,6 +89,7 @@ func (c *tartCLI) List(ctx context.Context) ([]VMInfo, error) {
 	for i, vm := range tartVMs {
 		vms[i] = VMInfo{
 			Name:   vm.Name,
+			Source: vm.Source,
 			Status: convertTartStatus(vm.State),
 		}
 	}

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +21,7 @@ func (c *tartCLI) Setup(ctx context.Context, config VMConfig) (string, error) {
 		return "", err
 	}
 
-	vmName := vmName(config.Nomad.AllocID)
+	vmName := config.name()
 	url := config.Driver.URL
 
 	c.logger.Trace("Setting up Tart VM", "name", vmName, "url", url)
@@ -38,6 +37,10 @@ func (c *tartCLI) Setup(ctx context.Context, config VMConfig) (string, error) {
 		memoryMB = int(config.Nomad.Resources.LinuxResources.MemoryLimitBytes / 1024 / 1024)
 	}
 
+	if config.Build != nil {
+		cpuCores = config.Build.VCPUs
+		memoryMB = int(config.Build.MemoryMB)
+	}
 	diskGB := config.Driver.DiskSize
 
 	var stderr bytes.Buffer
@@ -79,17 +82,20 @@ func (c *tartCLI) Start(ctx context.Context, vmName string, headless bool) (int,
 // StopVM stops a running Tart VM. The gracePeriod is the time to wait for
 // a graceful shutdown before forcefully terminating the VM.
 func (c *tartCLI) Stop(ctx context.Context, vmName string, gracePeriod time.Duration) error {
-	ctx, cancel := context.WithTimeout(ctx, gracePeriod)
+	if gracePeriod <= 0 {
+		gracePeriod = 10 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, gracePeriod+5*time.Second)
 	defer cancel()
 
 	c.logger.Trace("Stopping Tart VM", "name", vmName)
-	cmd := exec.CommandContext(ctx, "tart", "stop", vmName)
+	cmd := c.runner.Run(ctx, "tart", "stop", vmName, "--timeout", strconv.Itoa(int(gracePeriod.Seconds())))
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to stop VM %s: %v (stderr: %s)", vmName, err, stderr.String())
+		return c.acceptAbsentVM(ctx, vmName, fmt.Errorf("failed to stop VM %s: %v (stderr: %s)", vmName, err, stderr.String()))
 	}
 
 	return nil
@@ -98,7 +104,7 @@ func (c *tartCLI) Stop(ctx context.Context, vmName string, gracePeriod time.Dura
 // CloneVM clones a Tart VM
 func (c *tartCLI) CloneVM(ctx context.Context, sourceVM, targetVM string) error {
 	c.logger.Trace("Cloning Tart VM", "source", sourceVM, "target", targetVM)
-	cmd := exec.CommandContext(ctx, "tart", "clone", sourceVM, targetVM)
+	cmd := c.runner.Run(ctx, "tart", "clone", sourceVM, targetVM)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -114,13 +120,13 @@ func (c *tartCLI) CloneVM(ctx context.Context, sourceVM, targetVM string) error 
 // DeleteVM deletes a Tart VM
 func (c *tartCLI) Delete(ctx context.Context, vmName string) error {
 	c.logger.Trace("Deleting Tart VM", "name", vmName)
-	cmd := exec.CommandContext(ctx, "tart", "delete", vmName)
+	cmd := c.runner.Run(ctx, "tart", "delete", vmName)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to delete VM %s: %v (stderr: %s)", vmName, err, stderr.String())
+		return c.acceptAbsentVM(ctx, vmName, fmt.Errorf("failed to delete VM %s: %v (stderr: %s)", vmName, err, stderr.String()))
 	}
 
 	return nil
@@ -175,6 +181,21 @@ func (c *tartCLI) SetVMResources(ctx context.Context, vmName string, cpu, memory
 
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to set resources for VM %s: %v (stderr: %s)", vmName, err, stderr.String())
+	}
+	return nil
+}
+
+// A successful stop may precede DestroyTask or another stop after recovery.
+// Accept an operation error only when Tart independently confirms VM absence.
+func (c *tartCLI) acceptAbsentVM(ctx context.Context, name string, operationErr error) error {
+	vms, err := c.List(ctx)
+	if err != nil {
+		return operationErr
+	}
+	for _, vm := range vms {
+		if vm.Name == name && vm.Source != "oci" {
+			return operationErr
+		}
 	}
 	return nil
 }

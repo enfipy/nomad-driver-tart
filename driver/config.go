@@ -6,10 +6,15 @@ import "github.com/hashicorp/nomad/plugins/shared/hclspec"
 type Config struct {
 	// Enabled is set to true to enable the tart driver
 	Enabled bool `codec:"enabled"`
+	// Build restricts this client to operator-approved disposable builds.
+	Build *BuildConfig `codec:"build"`
 }
 
 // TaskConfig is the driver configuration of a task within a job
 type TaskConfig struct {
+	GuestAgent  bool   `codec:"guest_agent"`
+	Source      bool   `codec:"source"`
+	Artifacts   bool   `codec:"artifacts"`
 	URL         string `codec:"url"`
 	SSHUser     string `codec:"ssh_user"`
 	SSHPassword string `codec:"ssh_password"`
@@ -55,7 +60,7 @@ func (a Auth) IsValid() bool {
 var (
 	// configSpec is the hcl specification returned by the ConfigSchema RPC
 	configSpec = hclspec.NewObject(map[string]*hclspec.Spec{
-		// Config options can be specified here
+		"build": hclspec.NewBlock("build", false, buildConfigSpec),
 		"enabled": hclspec.NewDefault(
 			hclspec.NewAttr("enabled", "bool", false),
 			hclspec.NewLiteral("true"),
@@ -65,7 +70,10 @@ var (
 	// taskConfigSpec is the hcl specification for the driver config section of
 	// a task within a job. It is returned in the TaskConfigSchema RPC
 	taskConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
-		"url": hclspec.NewAttr("url", "string", true),
+		"url":         hclspec.NewAttr("url", "string", false),
+		"guest_agent": hclspec.NewAttr("guest_agent", "bool", false),
+		"source":      hclspec.NewAttr("source", "bool", false),
+		"artifacts":   hclspec.NewAttr("artifacts", "bool", false),
 		// ssh_user / ssh_password are required for normal (VM-running) tasks
 		// but not for pull_only tasks; this is enforced in the driver at
 		// StartTask time rather than by the schema.

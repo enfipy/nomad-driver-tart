@@ -6,6 +6,14 @@
 
 A custom task driver for HashiCorp Nomad that enables orchestration and management of [Tart](https://github.com/cirruslabs/tart) virtual machines on macOS.
 
+## Cloud build profile
+
+This fork preserves the upstream VM/SSH, networking, disk, registry authentication,
+prewarming and interactive behavior below. An optional **operator-owned `build`
+profile** restricts a Nomad client to trusted disposable build qualification.
+Jobs cannot opt out of the profile. See [build mode](docs/build-mode.md) for
+admission, guest-agent execution, ownership/recovery and the remaining live gates.
+
 ## Overview
 
 This driver allows Nomad to manage the lifecycle of Tart VMs, providing a way to run macOS virtual machines as Nomad tasks. It integrates with Nomad's ecosystem, enabling users to deploy and manage Tart VMs through Nomad's job specification.
@@ -175,14 +183,10 @@ nomad logs <ALLOCATION_ID>
 
 ## Development
 
-This driver is currently in development and provides basic functionality. Future enhancements may include:
-
-- Proper Tart VM lifecycle management
-- Resource isolation and management
-- Network configuration
-  - Bridged, host-only, and Softnet options
-- Volume mounts
-- Health checking
+On Apple Silicon, opt in to the pinned Tart interruption tests with
+`TART_QUALIFICATION_BINARY=/absolute/path/to/tart go test -race ./driver -run TestRealTartInterruptedStaging`.
+They use temporary Tart homes, sparse Linux disks and a localhost registry; they
+never boot a VM or use the installed image cache.
 
 ### Continuous Integration
 

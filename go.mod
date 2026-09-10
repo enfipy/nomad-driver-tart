@@ -8,6 +8,7 @@ require (
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/go-plugin v1.7.0
 	github.com/hashicorp/nomad v1.11.3
+	github.com/shirou/gopsutil/v3 v3.24.5
 	golang.org/x/crypto v0.48.0
 )
 
@@ -124,7 +125,6 @@ require (
 	github.com/ryanuber/go-glob v1.0.0 // indirect
 	github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529 // indirect
 	github.com/seccomp/libseccomp-golang v0.11.1 // indirect
-	github.com/shirou/gopsutil/v3 v3.24.5 // indirect
 	github.com/shoenig/go-landlock v1.2.2 // indirect
 	github.com/shoenig/go-m1cpu v0.2.1 // indirect
 	github.com/shoenig/test v1.12.2 // indirect

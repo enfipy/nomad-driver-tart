@@ -22,11 +22,15 @@ const (
 
 // VMInfo contains information about a virtual machine
 type VMInfo struct {
+	Source string  `json:"source,omitempty"`
 	Name   string  `json:"name"`
 	Status VMState `json:"status"`
 }
 
 type VMConfig struct {
+	// Name and Build are resolved by the driver, never decoded from a job.
+	Name  string
+	Build *BuildConfig
 	// The configuration that is custom to our custom driver
 	Driver TaskConfig
 	// The configuration that is shared with Nomad
@@ -91,4 +95,11 @@ type Client interface {
 	Commander
 	Networker
 	Builder
+}
+
+func (c VMConfig) name() string {
+	if c.Name != "" {
+		return c.Name
+	}
+	return vmName(c.Nomad.AllocID)
 }

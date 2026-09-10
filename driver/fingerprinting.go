@@ -75,6 +75,22 @@ func (d *Driver) buildFingerprint() *drivers.Fingerprint {
 		fp.Attributes[versionKey] = structs.NewStringAttribute(version)
 	}
 
+	if d.config.Build != nil {
+		c := d.config.Build
+		d.admission.Lock()
+		busy := d.build == nil || d.build.busy
+		d.admission.Unlock()
+		fp.HealthDescription = "trusted build qualification only"
+		fp.Attributes[availableSlotsKey] = structs.NewBoolAttribute(!busy)
+		fp.Attributes["driver.tart.image"] = structs.NewStringAttribute(c.Image)
+		fp.Attributes["driver.tart.xcode"] = structs.NewStringAttribute(c.Xcode)
+		fp.Attributes["driver.tart.vcpus"] = structs.NewIntAttribute(int64(c.VCPUs), "")
+		fp.Attributes["driver.tart.memory_mb"] = structs.NewIntAttribute(c.MemoryMB, "MiB")
+		fp.Attributes["driver.tart.usage_scope"] = structs.NewStringAttribute("vm_processes")
+		fp.Attributes["driver.tart.qualification_only"] = structs.NewBoolAttribute(true)
+		fp.Attributes["driver.tart.busy"] = structs.NewBoolAttribute(busy)
+		return fp
+	}
 	// Try to list VMs to verify virtualization software is working properly and calculate available slots
 	vms, err := d.client.List(fingerprintCtx)
 	if err != nil {

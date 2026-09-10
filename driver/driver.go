@@ -3,13 +3,19 @@ package driver
 
 import (
 	"context"
+	"fmt"
+	"reflect"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
+	plugin "github.com/hashicorp/go-plugin"
 	"github.com/hashicorp/nomad/drivers/shared/eventer"
+	"github.com/hashicorp/nomad/drivers/shared/executor"
 	"github.com/hashicorp/nomad/plugins/base"
 	"github.com/hashicorp/nomad/plugins/drivers"
 	"github.com/hashicorp/nomad/plugins/shared/hclspec"
+	pstructs "github.com/hashicorp/nomad/plugins/shared/structs"
 )
 
 const (
@@ -21,7 +27,7 @@ const (
 
 	// taskHandleVersion is the version of task handle which this driver sets
 	// and understands how to decode driver state
-	taskHandleVersion = 1
+	taskHandleVersion = 3
 )
 
 var (
@@ -44,6 +50,11 @@ var (
 
 // Driver is a driver for running Tart VM containers
 type Driver struct {
+	admission       sync.Mutex
+	configured      bool
+	build           *buildStore
+	executorFactory func(*drivers.TaskConfig, *drivers.TaskHandle) (executor.Executor, *plugin.Client, error)
+
 	// eventer is used to handle multiplexing of TaskEvents calls such that an
 	// event can be broadcast to all callers
 	eventer *eventer.Eventer
@@ -76,6 +87,11 @@ type Driver struct {
 // StartTask. This information is needed to rebuild the task state and handler
 // during recovery.
 type driverState struct {
+	VMName         string
+	Pid            int
+	ReattachConfig *pstructs.ReattachConfig
+	Build          bool
+
 	TaskConfig  *drivers.TaskConfig
 	StartedAt   time.Time
 	CompletedAt time.Time
@@ -121,7 +137,36 @@ func (d *Driver) SetConfig(cfg *base.Config) error {
 		}
 	}
 
+	d.admission.Lock()
+	defer d.admission.Unlock()
+	if d.build != nil {
+		if reflect.DeepEqual(d.config, &config) {
+			return nil
+		}
+		return fmt.Errorf("drain and restart to change a build profile")
+	}
+	if config.Build != nil {
+		if d.configured {
+			return fmt.Errorf("drain and restart to enable a build profile")
+		}
+		if !config.Enabled {
+			return fmt.Errorf("build profile requires enabled driver")
+		}
+		if err := config.Build.validate(); err != nil {
+			return err
+		}
+		if cfg.AgentConfig != nil {
+			d.nomadConfig = cfg.AgentConfig.Driver
+		}
+		previous := d.config
+		d.config = &config
+		if err := d.configureBuild(); err != nil {
+			d.config = previous
+			return err
+		}
+	}
 	d.config = &config
+	d.configured = true
 	if cfg.AgentConfig != nil {
 		d.nomadConfig = cfg.AgentConfig.Driver
 	}
@@ -136,6 +181,9 @@ func (d *Driver) TaskConfigSchema() (*hclspec.Spec, error) {
 
 // Capabilities returns the features supported by the driver.
 func (d *Driver) Capabilities() (*drivers.Capabilities, error) {
+	if d.config.Build != nil {
+		return &drivers.Capabilities{FSIsolation: drivers.FSIsolationImage}, nil
+	}
 	return capabilities, nil
 }
 
