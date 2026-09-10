@@ -32,8 +32,8 @@ into `/tmp/cloud-build`, runs argv once and captures its exit code. With `artifa
 it exports `/tmp/cloud-artifacts` as a bounded opaque tar into task-local storage,
 with SHA-256 and `build-result.json`. Nothing is extracted on the host. Download
 artifacts via authorized allocation filesystem access before Nomad GC. Guest
-stdout/stderr are cancellable and bounded; VM boot diagnostics are discarded in
-build mode so Tart cannot create an unbounded host log.
+stdout/stderr are cancellable and bounded; VM startup diagnostics remain in
+Nomad task logs.
 
 Ownership is persisted before clone. Short-lived CLI helpers retain the private
 store lock and are supervised through a parent-liveness pipe. The existing Nomad
@@ -43,6 +43,14 @@ restart first reattaches/stops recorded build executors and cleans owned VMs, th
 reports interrupted builds as failed. Ordinary VM/prewarm recovery reattaches its
 executor without replaying setup or startup commands. Old handles without recorded
 executor identity are rejected; drain old jobs before upgrading.
+
+Export ownership is journaled before creating the partial archive. After stopping
+old helpers and the VM, recovery removes the exact partial file and any archive
+renamed before its completion metadata was saved. Committed archives and unrelated
+files remain untouched. Unexpected file types, ownership or links keep cleanup
+pending and block admission, including when another build finishes. The temporary
+directory field is omitted after successful cleanup; rollback to older readers
+requires a completed drain with no pending cleanup.
 
 Softnet uses longest-prefix rules. Block host public, tailnet, private, link-local
 and administration addresses more specifically than any egress allow rule. The

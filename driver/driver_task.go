@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	plugin "github.com/hashicorp/go-plugin"
@@ -398,6 +399,8 @@ func (d *Driver) RecoverTask(h *drivers.TaskHandle) error {
 		return nil
 	}
 	if d.config.Build != nil || taskState.Build {
+		d.admission.Lock()
+		defer d.admission.Unlock()
 		if d.config.Build == nil || !taskState.Build {
 			return fmt.Errorf("recovery profile mismatch")
 		}
@@ -405,11 +408,35 @@ func (d *Driver) RecoverTask(h *drivers.TaskHandle) error {
 		if e != nil {
 			return e
 		}
-		if r.AllocID != h.Config.AllocID || r.CleanupPending {
-			return fmt.Errorf("cleanup required or identity mismatch")
+		if r.AllocID != h.Config.AllocID || h.Config.TaskDir().LocalDir != taskState.TaskConfig.TaskDir().LocalDir || (r.ArtifactDir != "" && r.ArtifactDir != h.Config.TaskDir().LocalDir) {
+			return fmt.Errorf("recovery artifact identity mismatch")
+		}
+		// Older records did not journal the export directory. The matching Nomad
+		// handle supplies it before any recovered terminal result is published.
+		r.ArtifactDir = h.Config.TaskDir().LocalDir
+		r.CleanupPending = true
+		if e := d.cleanupBuild(&r); e != nil {
+			r.Phase = "cleanup_pending"
+			r.Failure = strings.TrimPrefix(r.Failure+"; recovered artifact cleanup: "+e.Error(), "; ")
+			d.build.busy = true
+			if persist := d.save(r); persist != nil {
+				return fmt.Errorf("cleanup failed: %v; persisting cleanup: %w", e, persist)
+			}
+			return fmt.Errorf("recovered artifact cleanup: %w", e)
+		}
+		if r.Phase == "cleanup_pending" {
+			r.Phase = "complete"
+			r.Finished = time.Now()
+		}
+		if e := d.save(r); e != nil {
+			return e
 		}
 		if e := publishBuildResult(h.Config, r); e != nil {
 			return fmt.Errorf("publishing recovered build result: %w", e)
+		}
+		d.build.busy, e = d.pendingBuildCleanup()
+		if e != nil {
+			return e
 		}
 		th := &taskHandle{taskConfig: h.Config, build: &r, state: drivers.TaskStateExited, startedAt: r.Started, completedAt: r.Finished, exitResult: buildResult(r), doneCh: make(chan struct{})}
 		close(th.doneCh)
@@ -541,8 +568,12 @@ func (d *Driver) DestroyTask(taskID string, force bool) error {
 				return e
 			}
 			d.admission.Lock()
-			d.build.busy = false
+			pending, scanErr := d.pendingBuildCleanup()
+			d.build.busy = pending || scanErr != nil
 			d.admission.Unlock()
+			if scanErr != nil {
+				return scanErr
+			}
 		}
 		if e := os.Remove(d.recordPath(taskID)); e != nil && !errors.Is(e, os.ErrNotExist) {
 			return e

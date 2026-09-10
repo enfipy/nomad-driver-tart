@@ -27,6 +27,7 @@ type buildRecord struct {
 	CleanupPending             bool
 	Artifact                   string
 	ArtifactSHA256             string
+	ArtifactDir                string `json:",omitempty"`
 }
 
 func taskKey(id string) string { sum := sha256.Sum256([]byte(id)); return hex.EncodeToString(sum[:]) }
@@ -40,6 +41,9 @@ func newRecord(id, alloc, image string) buildRecord {
 func (r buildRecord) validate(key string) error {
 	if r.Schema != 1 || key != taskKey(r.TaskID) || !strings.HasPrefix(r.VM, "cloud-"+key[:24]+"-") || len(r.VM) != 47 || !nameToken.MatchString(r.VM) || !digestImage.MatchString(r.Image) {
 		return fmt.Errorf("invalid owned VM record")
+	}
+	if r.ArtifactDir != "" && (!filepath.IsAbs(r.ArtifactDir) || filepath.Clean(r.ArtifactDir) != r.ArtifactDir || filepath.Base(r.ArtifactDir) != "local") {
+		return fmt.Errorf("invalid owned artifact directory")
 	}
 	return nil
 }

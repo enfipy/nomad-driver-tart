@@ -150,6 +150,27 @@ func (d *Driver) reconcileBuilds() error {
 	return nil
 }
 
+// Called under admission after recovery; another build may already own the slot.
+func (d *Driver) pendingBuildCleanup() (bool, error) {
+	entries, e := os.ReadDir(filepath.Join(d.config.Build.StateDir, "records"))
+	if e != nil {
+		return true, e
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".record-") {
+			continue
+		}
+		r, e := readRecord(filepath.Join(d.config.Build.StateDir, "records", entry.Name()))
+		if e != nil {
+			return true, e
+		}
+		if r.CleanupPending || r.ArtifactDir != "" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // cleanupVM is shared by startup failure and build completion. Only the exact
 // owned destination is stopped/deleted; image caches and foreign VMs are untouched.
 func (d *Driver) cleanupVM(name string) error {
@@ -236,9 +257,60 @@ func (d *Driver) cleanupBuild(r *buildRecord) error {
 	if e := d.cleanupVM(r.VM); e != nil {
 		return e
 	}
+	if e := cleanupBuildArtifacts(*r); e != nil {
+		return e
+	}
+	r.ArtifactDir = ""
 	r.Reattach = nil
 	r.CleanupPending = false
 	return nil
+}
+
+// The directory is journaled before creating an export. Recovery holds the store
+// lock after old helpers exit, and stops the VM before removing these exact leaves.
+func cleanupBuildArtifacts(r buildRecord) error {
+	if r.ArtifactDir == "" {
+		return nil
+	}
+	if e := r.validate(taskKey(r.TaskID)); e != nil {
+		return e
+	}
+	if e := safeDir(r.ArtifactDir); e != nil {
+		if os.IsNotExist(e) { // Nomad may already have collected the allocation.
+			return nil
+		}
+		return e
+	}
+	name := r.VM + ".tar"
+	if r.Artifact != "" && r.Artifact != name {
+		return fmt.Errorf("artifact identity mismatch")
+	}
+	names := []string{name + ".partial"}
+	if r.Artifact == "" { // Rename can precede the durable artifact metadata.
+		names = append(names, name)
+	}
+	for _, name := range names {
+		path := filepath.Join(r.ArtifactDir, name)
+		s, e := os.Lstat(path)
+		if os.IsNotExist(e) {
+			continue
+		}
+		if e != nil {
+			return e
+		}
+		if !s.Mode().IsRegular() || int(s.Sys().(*syscall.Stat_t).Uid) != os.Geteuid() || s.Sys().(*syscall.Stat_t).Nlink != 1 {
+			return fmt.Errorf("refusing unexpected artifact object: %s", path)
+		}
+		if e := os.Remove(path); e != nil {
+			return e
+		}
+	}
+	dir, e := os.Open(r.ArtifactDir)
+	if e != nil {
+		return e
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 func buildResult(r buildRecord) *drivers.ExitResult {
 	result := &drivers.ExitResult{ExitCode: r.ExitCode}
@@ -293,7 +365,8 @@ func (d *Driver) finishBuild(h *taskHandle, exited *drivers.ExitResult) *drivers
 	*h.build = r
 	h.stateLock.Unlock()
 	d.admission.Lock()
-	d.build.busy = r.CleanupPending
+	pending, scanErr := d.pendingBuildCleanup()
+	d.build.busy = r.CleanupPending || pending || scanErr != nil
 	d.admission.Unlock()
 	d.buildEvent(h, r.Phase)
 	return buildResult(r)
@@ -397,6 +470,13 @@ func (d *Driver) collectBuild(ctx context.Context, h *taskHandle) error {
 	if e := safeDir(dir); e != nil {
 		return e
 	}
+	h.stateLock.Lock()
+	h.build.ArtifactDir = dir
+	r := *h.build
+	h.stateLock.Unlock()
+	if e := d.save(r); e != nil {
+		return e
+	}
 	name := h.vmName() + ".tar"
 	path := filepath.Join(dir, name)
 	f, e := os.OpenFile(path+".partial", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
@@ -423,7 +503,7 @@ func (d *Driver) collectBuild(ctx context.Context, h *taskHandle) error {
 	h.stateLock.Lock()
 	h.build.Artifact = name
 	h.build.ArtifactSHA256 = hex.EncodeToString(sum.Sum(nil))
-	r := *h.build
+	r = *h.build
 	h.stateLock.Unlock()
 	return d.save(r)
 }
